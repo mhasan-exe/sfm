@@ -33,8 +33,9 @@ jobs:
         with:
           channel: stable
 
+      # Fixed: Uses Flutter's internal mapping to accept Android SDK terms
       - name: Accept Android Licenses
-        run: yes | sdkmanager --licenses
+        run: yes | flutter doctor --android-licenses
 
       - name: Install dependencies
         run: flutter pub get
@@ -53,7 +54,6 @@ jobs:
       - name: Make Android Build
         run: flutter build apk --release
 
-      # Fix: Upload the release APK as a downloadable GitHub Actions artifact
       - name: Upload Android APK Artifact
         uses: actions/upload-artifact@v4
         with:
