@@ -183,10 +183,13 @@ class _ExchangeTimetableDialogState
                     return const Center(child: CircularProgressIndicator());
                   }
                   return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                    // Single equality filter (`teacherId`) — filtering by
+                    // `date` too client-side avoids needing a manually
+                    // created composite index in every school's Firebase
+                    // project.
                     stream: _firestore
                         .collection('daily_timetables')
                         .where('teacherId', isEqualTo: user.uid)
-                        .where('date', isEqualTo: _todayKey)
                         .snapshots(),
                     builder: (context, snapshot) {
                   if (snapshot.connectionState == ConnectionState.waiting) {
@@ -194,6 +197,7 @@ class _ExchangeTimetableDialogState
                   }
 
                   final docs = [...(snapshot.data?.docs ?? [])]
+                    ..retainWhere((d) => d.data()['date']?.toString() == _todayKey)
                     ..sort((a, b) =>
                         ((a.data()['unit'] as num?)?.toInt() ?? 0)
                             .compareTo((b.data()['unit'] as num?)?.toInt() ?? 0));

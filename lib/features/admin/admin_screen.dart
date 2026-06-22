@@ -23,6 +23,7 @@ import 'pages/admin_logs_page.dart';
 import 'pages/admin_announcements_page.dart';
 import 'pages/admin_break_duty_page.dart';
 import 'pages/admin_config_page.dart';
+import 'pages/admin_presets_page.dart';
 import 'pages/admin_time_profile_page.dart';
 // Bento UI helpers (future migration of remaining widgets)
 import 'widgets/admin_bento.dart';
@@ -591,6 +592,7 @@ class _AdminScreenState extends State<AdminScreen> {
       'Logs',
       'Break Duties',
       'Announcements',
+      'Presets',
       'Settings',
     ];
 
@@ -603,12 +605,13 @@ class _AdminScreenState extends State<AdminScreen> {
       Icons.history,
       Icons.shield_outlined,
       Icons.campaign_outlined,
+      Icons.save_outlined,
       Icons.settings_outlined,
     ];
 
     return Container(
       width: 260,
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.symmetric(horizontal: 20),
       decoration: BoxDecoration(
         color: const Color(0xFF171A22),
         border: Border(
@@ -629,59 +632,79 @@ class _AdminScreenState extends State<AdminScreen> {
             ),
           ),
           const SizedBox(height: 40),
-          ...List.generate(
-            items.length,
-            (index) {
-              final selected = selectedSidebar == index;
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(18),
-                  onTap: () {
-                    Navigator.maybePop(context);
-                    if (index == 6) {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const AdminBreakDutyPage()),
+          // Scrollable so adding more sidebar entries over time never
+          // overflows the available height (drawer on mobile, fixed-width
+          // column on desktop — both have a bounded height already).
+          Expanded(
+            child: ScrollConfiguration(
+              behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.only(bottom: 20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: List.generate(
+                    items.length,
+                    (index) {
+                      final selected = selectedSidebar == index;
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(18),
+                          onTap: () {
+                            Navigator.maybePop(context);
+                            if (index == 6) {
+                              Navigator.of(context).push(
+                                MaterialPageRoute(builder: (_) => const AdminBreakDutyPage()),
+                              );
+                              return;
+                            }
+                            if (index == 7) {
+                              Navigator.of(context).push(
+                                MaterialPageRoute(builder: (_) => const AdminAnnouncementsPage()),
+                              );
+                              return;
+                            }
+                            if (index == 8) {
+                              Navigator.of(context).push(
+                                MaterialPageRoute(builder: (_) => const AdminPresetsPage()),
+                              );
+                              return;
+                            }
+                            if (index == 9) {
+                              Navigator.of(context).push(
+                                MaterialPageRoute(builder: (_) => const AdminConfigPage()),
+                              );
+                              return;
+                            }
+                            setState(() {
+                              selectedSidebar = index;
+                            });
+                          },
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 250),
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: selected
+                                  ? const Color(0xFF4F8CFF)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(18),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(icons[index]),
+                                const SizedBox(width: 14),
+                                Text(items[index]),
+                              ],
+                            ),
+                          ),
+                        ),
                       );
-                      return;
-                    }
-                    if (index == 7) {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const AdminAnnouncementsPage()),
-                      );
-                      return;
-                    }
-                    if (index == 8) {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const AdminConfigPage()),
-                      );
-                      return;
-                    }
-                    setState(() {
-                      selectedSidebar = index;
-                    });
-                  },
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 250),
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: selected
-                          ? const Color(0xFF4F8CFF)
-                          : Colors.transparent,
-                      borderRadius: BorderRadius.circular(18),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(icons[index]),
-                        const SizedBox(width: 14),
-                        Text(items[index]),
-                      ],
-                    ),
+                    },
                   ),
                 ),
-              );
-            },
-          )
+              ),
+            ),
+          ),
         ],
       ),
     );

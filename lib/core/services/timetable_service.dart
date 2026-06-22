@@ -282,12 +282,16 @@ class TimetableService {
           cls.teachers.where((t) => t.teacherId == draggedTeacherId).toList();
       final quota = matchingTeachers.isEmpty ? null : matchingTeachers.first.unitsWeek;
       if (quota != null) {
+        // Single equality filter (`classId`) + client-side teacherId
+        // filter — avoids needing a manually-created composite index for
+        // this exact (classId, teacherId) combo in every school's
+        // Firebase project. A class's weekly slot count is always small
+        // (one school day's worth of periods), so this is cheap.
         final currentCountSnap = await _weekly
             .where('classId', isEqualTo: classId)
-            .where('teacherId', isEqualTo: draggedTeacherId)
             .get();
         final currentCount = currentCountSnap.docs
-            .where((d) => d.id != destinationSlotId)
+            .where((d) => d.id != destinationSlotId && d.data()['teacherId'] == draggedTeacherId)
             .length;
         if (currentCount + 1 > quota) {
           quotaWarning =

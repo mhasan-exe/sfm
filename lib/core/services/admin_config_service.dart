@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
+import 'timetable_preset_service.dart';
 import 'timetable_service.dart';
 
 class TimetableGenerationSummary {
@@ -19,13 +20,24 @@ class AdminConfigService {
       FirebaseFirestore.instance.collection('admin_configs');
 
   // Save timetable generation schedule
+  //
+  // `mode` is 'generate' (run the algorithm fresh, the historical default)
+  // or 'preset' (load a saved snapshot instead) — set `presetId` when mode
+  // is 'preset'. Whatever external trigger eventually fires this schedule
+  // (manual "Run now" button, or a scheduled job) should read this same
+  // mode/presetId pair from [getTimetableGenerationSchedule] and act on it
+  // via [triggerTimetableGeneration], which already branches correctly.
   Future<void> setTimetableGenerationSchedule({
     required String generationTime, // Format: "HH:mm" e.g., "23:30"
     required String generationDay, // e.g., "Sunday"
+    String mode = 'generate',
+    String? presetId,
   }) async {
     await _configs.doc('timetable_generation').set({
       'generationTime': generationTime,
       'generationDay': generationDay,
+      'mode': mode,
+      'presetId': presetId,
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   }
@@ -77,7 +89,33 @@ class AdminConfigService {
   // Timetable page uses) across every class.
   Future<TimetableGenerationSummary> triggerTimetableGeneration({
     required String triggeredBy,
+    String? triggeredByName,
   }) async {
+    final schedule = await getTimetableGenerationSchedule();
+    final mode = schedule?['mode']?.toString() ?? 'generate';
+    final presetId = schedule?['presetId']?.toString();
+
+    if (mode == 'preset' && presetId != null && presetId.isNotEmpty) {
+      try {
+        await TimetablePresetService().loadPreset(
+          presetId,
+          loadedBy: triggeredBy,
+          loadedByName: triggeredByName ?? triggeredBy,
+        );
+        return const TimetableGenerationSummary(
+          classesGenerated: 0,
+          classesSkipped: 0,
+          warnings: ['Loaded saved preset instead of generating fresh.'],
+        );
+      } catch (e) {
+        return TimetableGenerationSummary(
+          classesGenerated: 0,
+          classesSkipped: 0,
+          warnings: ['Failed to load preset: $e'],
+        );
+      }
+    }
+
     final classesSnapshot =
         await FirebaseFirestore.instance.collection('classes').get();
 

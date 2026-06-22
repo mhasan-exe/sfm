@@ -133,11 +133,14 @@ class AnnouncementService {
   /// (the acknowledge prompt itself may still show until dismissed).
   Future<void> runEventReminderSweep(String uid) async {
     try {
-      final snap = await _announcements
-          .where('active', isEqualTo: true)
-          .where('type', isEqualTo: 'event')
-          .get();
-      if (snap.docs.isEmpty) return;
+      // Single equality filter (`type`) + client-side filtering for
+      // `active` — this is a brand-new collection in every school's
+      // Firebase project, so there's no pre-existing composite index for
+      // a two-field query like (active, type). Filtering one field here
+      // guarantees this never silently breaks on a fresh deployment.
+      final snap = await _announcements.where('type', isEqualTo: 'event').get();
+      final activeDocs = snap.docs.where((d) => d.data()['active'] == true).toList();
+      if (activeDocs.isEmpty) return;
 
       final ackedSnap = await _acks.where('uid', isEqualTo: uid).get();
       final ackedIds = ackedSnap.docs
@@ -145,7 +148,7 @@ class AnnouncementService {
           .toSet();
 
       final now = DateTime.now();
-      for (final doc in snap.docs) {
+      for (final doc in activeDocs) {
         if (ackedIds.contains(doc.id)) continue;
         final announcement = AnnouncementModel.fromMap(doc.id, doc.data());
         final eventAt = announcement.eventAt;

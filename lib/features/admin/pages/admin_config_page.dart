@@ -2,8 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 import '../../../core/services/admin_config_service.dart';
+import '../../../core/services/timetable_preset_service.dart';
 import '../../../core/widgets/glass_card.dart';
 import '../../../core/widgets/app_background.dart';
+import '../../../models/timetable_preset_model.dart';
+import 'admin_presets_page.dart';
 
 /// Compact, section-based Settings page. Replaces the old always-expanded
 /// giant-form layout with collapsible ExpansionTiles so the whole page
@@ -25,6 +28,10 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
   final genDayController = TextEditingController();
   final resetTimeController = TextEditingController();
   final resetDayController = TextEditingController();
+
+  // Scheduled-run mode: regenerate fresh, or load a saved preset instead.
+  String _generationMode = 'generate';
+  String? _selectedPresetId;
 
   // Settings
   bool allowFixtureMarketplace = true;
@@ -58,6 +65,8 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
       if (genSchedule != null) {
         genTimeController.text = genSchedule['generationTime'] ?? '';
         genDayController.text = genSchedule['generationDay'] ?? '';
+        _generationMode = genSchedule['mode']?.toString() ?? 'generate';
+        _selectedPresetId = genSchedule['presetId']?.toString();
       }
       if (resetSchedule != null) {
         resetTimeController.text = resetSchedule['resetTime'] ?? '';
@@ -115,10 +124,16 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
       _toast('Please fill all fields');
       return;
     }
+    if (_generationMode == 'preset' && (_selectedPresetId == null || _selectedPresetId!.isEmpty)) {
+      _toast('Pick a preset to load, or switch back to "Generate fresh"');
+      return;
+    }
     try {
       await configService.setTimetableGenerationSchedule(
         generationTime: genTimeController.text.trim(),
         generationDay: genDayController.text.trim(),
+        mode: _generationMode,
+        presetId: _generationMode == 'preset' ? _selectedPresetId : null,
       );
       _toast('Timetable generation schedule saved');
     } catch (e) {
@@ -168,9 +183,11 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Generate All Timetables'),
-        content: const Text(
-          'This will regenerate the weekly timetable for every class using each class\'s configured teachers and quotas. Continue?',
+        title: const Text('Run Timetable Automation'),
+        content: Text(
+          _generationMode == 'preset'
+              ? 'This loads the saved preset into the live timetable (auto-backing up the current one first). Make sure you\'ve clicked Save above so the latest preset choice is used. Continue?'
+              : 'This will regenerate the weekly timetable for every class using each class\'s configured teachers and quotas. Continue?',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
@@ -180,8 +197,12 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
     );
     if (confirm != true) return;
     try {
-      final adminId = FirebaseAuth.instance.currentUser?.uid ?? 'unknown_admin';
-      final summary = await configService.triggerTimetableGeneration(triggeredBy: adminId);
+      final user = FirebaseAuth.instance.currentUser;
+      final adminId = user?.uid ?? 'unknown_admin';
+      final summary = await configService.triggerTimetableGeneration(
+        triggeredBy: adminId,
+        triggeredByName: user?.displayName ?? user?.email,
+      );
       _toast(
         'Generated ${summary.classesGenerated} class(es)'
         '${summary.classesSkipped > 0 ? ', ${summary.classesSkipped} skipped' : ''}'
@@ -445,6 +466,70 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
                           ],
                         ),
                         const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: ChoiceChip(
+                                label: const Text('Generate fresh'),
+                                selected: _generationMode == 'generate',
+                                onSelected: (_) => setState(() => _generationMode = 'generate'),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: ChoiceChip(
+                                label: const Text('Load preset'),
+                                selected: _generationMode == 'preset',
+                                onSelected: (_) => setState(() => _generationMode = 'preset'),
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (_generationMode == 'preset') ...[
+                          const SizedBox(height: 8),
+                          StreamBuilder<List<TimetablePresetModel>>(
+                            stream: TimetablePresetService().watchPresets(),
+                            builder: (context, presetSnap) {
+                              final presets = presetSnap.data ?? const [];
+                              if (presets.isEmpty) {
+                                return Text(
+                                  'No saved presets yet — save the current timetable as a preset first.',
+                                  style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.6)),
+                                );
+                              }
+                              final validId = presets.any((p) => p.id == _selectedPresetId)
+                                  ? _selectedPresetId
+                                  : null;
+                              return DropdownButtonFormField<String>(
+                                initialValue: validId,
+                                decoration: const InputDecoration(labelText: 'Preset to load', isDense: true),
+                                items: presets
+                                    .map((p) => DropdownMenuItem(
+                                          value: p.id,
+                                          child: Text(
+                                            '${p.name} (${p.slotCount} slots)',
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ))
+                                    .toList(),
+                                onChanged: (v) => setState(() => _selectedPresetId = v),
+                              );
+                            },
+                          ),
+                        ],
+                        const SizedBox(height: 4),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: TextButton.icon(
+                            onPressed: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (context) => const AdminPresetsPage()),
+                            ),
+                            icon: const Icon(Icons.save_outlined, size: 16),
+                            label: const Text('Manage presets', style: TextStyle(fontSize: 12.5)),
+                          ),
+                        ),
+                        const SizedBox(height: 4),
                         Row(
                           children: [
                             Expanded(

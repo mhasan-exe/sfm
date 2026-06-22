@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'timetable_constants.dart';
 
 class TeacherQuota {
@@ -66,19 +68,33 @@ class TimetableGeneratorResult {
 /// - A teacher teaches at most one unit per day in this class.
 /// - A teacher must not be assigned more units in a week than their quota.
 ///
-/// Preferences (soft, expressed as scoring penalties):
+/// Preferences (soft, expressed as scoring penalties — lower score wins):
 /// - Avoid back-to-back units for the same teacher.
 /// - Avoid giving a teacher the SAME unit number on consecutive working days
 ///   (e.g. unit 8 on Monday should discourage unit 8 again on Tuesday).
-/// - Avoid giving a teacher the same unit number repeatedly across the week.
-/// - Spread load: prefer teachers who are furthest below their quota.
+/// - Strongly avoid giving a teacher the same unit number repeatedly across
+///   the week — this is what stops "the same teacher every day on unit 2"
+///   whenever a genuinely free alternate teacher exists for that slot.
+/// - Spread load: mildly prefer teachers who are furthest below their quota.
+/// - When several teachers end up scoring about the same for a slot, the
+///   choice is randomized fairly between them rather than always picking
+///   whichever teacher happens to be listed first — re-running generation
+///   on the same input can therefore produce a slightly different (but
+///   equally valid) rotation, which is intentional.
+///
+/// Note: if a class genuinely only has ONE eligible teacher for a given
+/// unit (no clash, has quota) on every working day, the generator cannot
+/// invent variety out of nothing — add a second teacher with quota for
+/// that slot if rotation is wanted.
 class TimetableGenerator {
   static TimetableGeneratorResult generate({
     required List<AssignmentSlot> slots,
     required List<TeacherQuota> teacherQuotas,
     Map<String, List<BusyBlock>> externalBusy = const {},
     bool force = false,
+    Random? random,
   }) {
+    final rng = random ?? Random();
     final warnings = <String>[];
     final slotToTeacher = <String, String>{};
     final unfilled = <String>[];
@@ -199,8 +215,12 @@ class TimetableGenerator {
     for (final s in ordered) {
       if (slotToTeacher.containsKey(s.slotId)) continue;
 
-      String? best;
-      int bestScore = 1 << 30;
+      // Collect every eligible teacher's score, then pick randomly among
+      // whichever are tied for best (within a small tolerance) — this is
+      // the "if multiple valid teachers exist, randomize fairly" rule.
+      // Without this, ties were always broken by list order, so the same
+      // first-listed teacher silently won every single day → zero variety.
+      final candidates = <(String uid, int score)>[];
 
       for (final t in teacherQuotas) {
         if (clashes(t.uid, s)) continue; // hard rule, always
@@ -233,25 +253,39 @@ class TimetableGenerator {
         }
 
         // Soft: avoid repeating the same unit for this teacher across the
-        // whole week (cumulative — escalates the more often it repeats).
+        // whole week. Weighted heavily (300/occurrence, escalating) so it
+        // reliably outweighs the quota-spread term below whenever a
+        // genuinely free alternate teacher exists — this is the main fix
+        // for "the same teacher gets unit 2 every single day".
         final repeatCnt = unitRepeatCount[t.uid]?[s.unit] ?? 0;
-        score += repeatCnt * 60;
+        score += repeatCnt * 300;
 
         // Soft: over-quota is undesirable even in force mode.
         if (!hasQuota) score += 2000;
 
-        // Balance: prefer teachers with more remaining quota (spreads load).
-        score -= (remaining[t.uid] ?? 0) * 5;
+        // Balance: mildly prefer teachers with more remaining quota
+        // (spreads load) — intentionally a *small* influence relative to
+        // the repeat penalty above, so it tie-breaks rather than dominates.
+        score -= (remaining[t.uid] ?? 0) * 2;
 
-        if (score < bestScore) {
-          bestScore = score;
-          best = t.uid;
-        }
+        // Small random jitter so genuinely-comparable candidates don't
+        // always resolve to the same teacher in the same order every time
+        // a timetable is (re)generated.
+        score += rng.nextInt(20);
+
+        candidates.add((t.uid, score));
       }
 
-      if (best != null) {
-        commit(s, best);
-        unitRepeatCount[best]?[s.unit] = (unitRepeatCount[best]?[s.unit] ?? 0) + 1;
+      if (candidates.isNotEmpty) {
+        candidates.sort((a, b) => a.$2.compareTo(b.$2));
+        final bestScore = candidates.first.$2;
+        // Anyone within a small tolerance of the best score is considered
+        // an equally valid pick — randomize among them.
+        final tied = candidates.where((c) => c.$2 <= bestScore + 15).toList();
+        final chosen = tied[rng.nextInt(tied.length)].$1;
+
+        commit(s, chosen);
+        unitRepeatCount[chosen]?[s.unit] = (unitRepeatCount[chosen]?[s.unit] ?? 0) + 1;
       } else {
         unfilled.add(s.slotId);
       }

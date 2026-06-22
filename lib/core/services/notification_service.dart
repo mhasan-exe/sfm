@@ -369,28 +369,33 @@ class NotificationService {
       final dateKey =
           '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
 
-      // Today's effective schedule = weekly slots for today, overlaid by
-      // any daily override for today (mirrors teacher_timetable_screen's
-      // merge logic) so reminders always reflect what's actually live.
+      // Single equality filter (`teacherId`) + client-side day/date
+      // filtering — matches the safe pattern already used elsewhere in
+      // this app (see teacher_timetable_screen.dart's _weeklyForTeacher).
+      // A two-field where() chain here would need a manually-created
+      // composite index in every school's Firebase project; this never
+      // does.
       final weeklySnap = await _firestore
           .collection('weekly_timetables')
           .where('teacherId', isEqualTo: teacherId)
-          .where('day', isEqualTo: today)
           .get();
       final dailySnap = await _firestore
           .collection('daily_timetables')
           .where('teacherId', isEqualTo: teacherId)
-          .where('date', isEqualTo: dateKey)
           .get();
 
       final byUnit = <int, Map<String, dynamic>>{};
       for (final d in weeklySnap.docs) {
-        final unit = (d.data()['unit'] as num?)?.toInt() ?? 0;
-        if (unit > 0) byUnit[unit] = d.data();
+        final data = d.data();
+        if (data['day']?.toString() != today) continue;
+        final unit = (data['unit'] as num?)?.toInt() ?? 0;
+        if (unit > 0) byUnit[unit] = data;
       }
       for (final d in dailySnap.docs) {
-        final unit = (d.data()['unit'] as num?)?.toInt() ?? 0;
-        if (unit > 0) byUnit[unit] = d.data();
+        final data = d.data();
+        if (data['date']?.toString() != dateKey) continue;
+        final unit = (data['unit'] as num?)?.toInt() ?? 0;
+        if (unit > 0) byUnit[unit] = data;
       }
 
       for (final entry in byUnit.entries) {

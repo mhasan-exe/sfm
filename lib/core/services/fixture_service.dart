@@ -70,13 +70,18 @@ class FixtureService {
       if (onLeave) return false;
     }
 
+    // Single equality filter + client-side filtering throughout this
+    // method on purpose: weekly_timetables/daily_timetables/fixtures are
+    // all small-ish per-teacher collections, and this guarantees no new
+    // composite index is ever required in a freshly deployed school's
+    // Firebase project.
     final weeklyBusySnap = await FirebaseFirestore.instance
         .collection('weekly_timetables')
         .where('teacherId', isEqualTo: teacherId)
-        .where('day', isEqualTo: fixture.day)
         .get();
     for (final d in weeklyBusySnap.docs) {
       final data = d.data();
+      if (data['day']?.toString() != fixture.day) continue;
       if (_overlaps(fixture.startTime, fixture.endTime, data['startTime']?.toString() ?? '', data['endTime']?.toString() ?? '')) {
         return false;
       }
@@ -85,11 +90,11 @@ class FixtureService {
     if (fixture.date.isNotEmpty) {
       final dailyBusySnap = await FirebaseFirestore.instance
           .collection('daily_timetables')
-          .where('teacherId', isEqualTo: teacherId)
           .where('date', isEqualTo: fixture.date)
           .get();
       for (final d in dailyBusySnap.docs) {
         final data = d.data();
+        if (data['teacherId']?.toString() != teacherId) continue;
         if (_overlaps(fixture.startTime, fixture.endTime, data['startTime']?.toString() ?? '', data['endTime']?.toString() ?? '')) {
           return false;
         }
@@ -98,11 +103,11 @@ class FixtureService {
 
     final otherClaimedSnap = await _fixtures
         .where('claimedBy', isEqualTo: teacherId)
-        .where('day', isEqualTo: fixture.day)
         .get();
     for (final d in otherClaimedSnap.docs) {
       if (d.id == fixture.id) continue;
       final data = d.data();
+      if (data['day']?.toString() != fixture.day) continue;
       if (_overlaps(fixture.startTime, fixture.endTime, data['startTime']?.toString() ?? '', data['endTime']?.toString() ?? '')) {
         return false;
       }
@@ -156,51 +161,16 @@ class FixtureService {
     }
 
     // Only FREE teachers can claim cover — block if this teacher already
-    // has a class (or another fixture) at the exact same day/time. Checks
-    // both the recurring weekly pattern and that specific date's daily
-    // overrides, so an already-claimed fixture for the same slot also
-    // counts as "busy".
-    final fixtureDay = fixture['day']?.toString() ?? '';
-    final fixtureStart = fixture['startTime']?.toString() ?? '';
-    final fixtureEnd = fixture['endTime']?.toString() ?? '';
-    if (fixtureDay.isNotEmpty && fixtureStart.isNotEmpty && fixtureEnd.isNotEmpty) {
-      final weeklyBusySnap = await FirebaseFirestore.instance
-          .collection('weekly_timetables')
-          .where('teacherId', isEqualTo: teacherId)
-          .where('day', isEqualTo: fixtureDay)
-          .get();
-      for (final d in weeklyBusySnap.docs) {
-        final data = d.data();
-        if (_overlaps(fixtureStart, fixtureEnd, data['startTime']?.toString() ?? '', data['endTime']?.toString() ?? '')) {
-          throw Exception('You already have a class at this time — only free teachers can claim cover.');
-        }
-      }
-
-      if (fixtureDate != null && fixtureDate.isNotEmpty) {
-        final dailyBusySnap = await FirebaseFirestore.instance
-            .collection('daily_timetables')
-            .where('teacherId', isEqualTo: teacherId)
-            .where('date', isEqualTo: fixtureDate)
-            .get();
-        for (final d in dailyBusySnap.docs) {
-          final data = d.data();
-          if (_overlaps(fixtureStart, fixtureEnd, data['startTime']?.toString() ?? '', data['endTime']?.toString() ?? '')) {
-            throw Exception('You already have a class at this time — only free teachers can claim cover.');
-          }
-        }
-      }
-
-      final otherClaimedSnap = await _fixtures
-          .where('claimedBy', isEqualTo: teacherId)
-          .where('day', isEqualTo: fixtureDay)
-          .get();
-      for (final d in otherClaimedSnap.docs) {
-        if (d.id == fixtureId) continue;
-        final data = d.data();
-        if (_overlaps(fixtureStart, fixtureEnd, data['startTime']?.toString() ?? '', data['endTime']?.toString() ?? '')) {
-          throw Exception('You\'re already covering another fixture at this time.');
-        }
-      }
+    // has a class (or another fixture) at the exact same day/time. Reuses
+    // the same check the marketplace UI uses to grey out the button, so
+    // there's exactly one definition of "busy" instead of two that could
+    // drift apart.
+    final isFree = await isTeacherFreeForFixture(
+      FixtureModel.fromMap(fixtureId, fixture),
+      teacherId,
+    );
+    if (!isFree) {
+      throw Exception('You already have a class (or another fixture) at this time — only free teachers can claim cover.');
     }
 
     // Check if teacher can take this fixture (unit limits) — actively
@@ -463,20 +433,31 @@ class FixtureService {
   }
 
   // Mark fixtures as expired if past expiry time
+  //
+  // IMPORTANT: this deliberately filters by a SINGLE equality field
+  // (`isExpired`) at the database level and does the rest (the time
+  // comparison + status check) client-side. Firestore flatly rejects any
+  // query with inequality filters (<, <=, >, >=, !=) on more than one
+  // field — combining `expiresAt < now` with `status != 'assigned'` used
+  // to throw "Invalid query" every single time this ran. Filtering by one
+  // equality field also means this never needs a manually-created
+  // composite index in a new school's Firebase project.
   Future<void> expireFixtures() async {
     final now = DateTime.now();
 
-    final expiredSnapshot = await _fixtures
-        .where('expiresAt', isLessThan: now)
-        .where('isExpired', isEqualTo: false)
-        .where('status', isNotEqualTo: 'assigned')
-        .get();
+    final snapshot = await _fixtures.where('isExpired', isEqualTo: false).get();
+    final toExpire = snapshot.docs.where((doc) {
+      final data = doc.data();
+      final expiresAt = (data['expiresAt'] as Timestamp?)?.toDate();
+      final status = data['status']?.toString();
+      return expiresAt != null && expiresAt.isBefore(now) && status != 'assigned';
+    }).toList();
 
-    if (expiredSnapshot.docs.isEmpty) return;
+    if (toExpire.isEmpty) return;
 
     final batch = FirebaseFirestore.instance.batch();
 
-    for (final doc in expiredSnapshot.docs) {
+    for (final doc in toExpire) {
       batch.update(doc.reference, {
         'isExpired': true,
         'status': 'expired',

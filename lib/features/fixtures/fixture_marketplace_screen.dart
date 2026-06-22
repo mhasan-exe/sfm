@@ -336,7 +336,7 @@ class _FixtureMarketplaceScreenState extends State<FixtureMarketplaceScreen>
   }) {
     final data = fixture.data() as Map;
     final className = data['className'] as String? ?? 'Unknown Class';
-    final unit = data['unit'] as String? ?? 'Unit';
+    final unit = data['unit']?.toString() ?? 'Unit';
     final day = data['day'] as String? ?? '';
     final startTime = data['startTime'] as String? ?? '';
     final endTime = data['endTime'] as String? ?? '';
@@ -518,7 +518,7 @@ class _FixtureMarketplaceScreenState extends State<FixtureMarketplaceScreen>
   }) {
     final data = fixture.data() as Map;
     final className = data['className'] as String? ?? 'Unknown';
-    final unit = data['unit'] as String? ?? '';
+    final unit = data['unit']?.toString() ?? '';
     final startTime = data['startTime'] as String? ?? '';
     final endTime = data['endTime'] as String? ?? '';
 
