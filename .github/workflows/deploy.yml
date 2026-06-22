@@ -22,10 +22,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+
+      - name: Accept Android Licenses
+        run: yes | sdkmanager --licenses
 
       - name: Install dependencies
         run: flutter pub get
@@ -36,13 +45,22 @@ jobs:
       - name: Build Web
         run: flutter build web --release --base-href "/sfm/"
 
-      - name: Upload Artifact
+      - name: Upload Web Artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: build/web
         
       - name: Make Android Build
         run: flutter build apk --release
+
+      # Fix: Upload the release APK as a downloadable GitHub Actions artifact
+      - name: Upload Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
   deploy:
     environment:
       name: github-pages
