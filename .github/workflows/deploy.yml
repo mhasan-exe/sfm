@@ -40,7 +40,9 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: build/web
-
+        
+      - name: Make Android Build
+        run: flutter build apk --release
   deploy:
     environment:
       name: github-pages
