@@ -26,7 +26,6 @@ import 'pages/admin_config_page.dart';
 import 'pages/admin_presets_page.dart';
 import 'pages/admin_time_profile_page.dart';
 // Bento UI helpers (future migration of remaining widgets)
-import 'widgets/admin_bento.dart';
 
 import 'widgets/admin_dashboard_analytics.dart';
 

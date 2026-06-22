@@ -1,4 +1,4 @@
-package com.example.sfm
+package com.akesp.sfm
 
 import io.flutter.embedding.android.FlutterActivity
 

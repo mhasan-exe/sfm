@@ -621,7 +621,7 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
                                   .map((log) => Padding(
                                         padding: const EdgeInsets.symmetric(vertical: 4),
                                         child: Text(
-                                          '${(log['action'] ?? '').toString().replaceAll('_', ' ')}',
+                                          (log['action'] ?? '').toString().replaceAll('_', ' '),
                                           style: const TextStyle(fontSize: 12.5),
                                         ),
                                       ))

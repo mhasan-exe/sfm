@@ -6,7 +6,6 @@ import '../../../core/services/timetable_service.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/app_background.dart';
 import '../../../core/widgets/glass_card.dart';
-import '../widgets/admin_bento.dart';
 
 
 class AdminClassPage extends StatefulWidget {
