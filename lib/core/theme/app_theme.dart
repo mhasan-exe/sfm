@@ -135,7 +135,7 @@ class AppTheme {
     ),
 
     cardTheme: CardThemeData(
-      color: const Color(0x001f1f2e),
+      color: const Color(0xFF141B2E),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(radiusLg),
       ),

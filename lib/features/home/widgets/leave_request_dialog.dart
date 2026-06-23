@@ -39,6 +39,7 @@ class _LeaveRequestDialogState extends State<LeaveRequestDialog> {
       lastDate: DateTime(2100),
     );
     if (picked == null) return;
+    if (!mounted) return;
     setState(() {
       _startDate = picked;
       if (_endDate.isBefore(_startDate)) {
@@ -55,6 +56,7 @@ class _LeaveRequestDialogState extends State<LeaveRequestDialog> {
       lastDate: DateTime(2100),
     );
     if (picked == null) return;
+    if (!mounted) return;
     setState(() {
       _endDate = picked;
       if (_endDate.isBefore(_startDate)) {
@@ -84,6 +86,8 @@ class _LeaveRequestDialogState extends State<LeaveRequestDialog> {
       startDate: _startDate,
       endDate: _endDate,
     );
+
+    if (!mounted) return;
 
     if (hasOverlap) {
       ScaffoldMessenger.of(context).showSnackBar(

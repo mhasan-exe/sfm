@@ -360,6 +360,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                                   lastDate: now.add(const Duration(days: 365)),
                                 );
                                 if (picked == null) return;
+                                if (!mounted) return;
                                 setState(() => _selectedDate = picked);
                                 await _materializeDailyForSelectedDate();
                                 if (!mounted) return;

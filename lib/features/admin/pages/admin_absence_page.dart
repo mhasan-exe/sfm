@@ -164,6 +164,7 @@ class _AdminAbsenceManagementPageState
                                 .add(const Duration(days: 30)),
                           );
 
+                          if (!mounted) return;
                           if (picked != null) {
                             setState(() => selectedDate = picked);
                           }

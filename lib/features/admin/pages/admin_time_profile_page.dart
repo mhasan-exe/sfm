@@ -369,6 +369,7 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
         : TimeOfDay.now();
     final picked = await showTimePicker(context: context, initialTime: initial);
     if (picked == null) return;
+    if (!mounted) return;
     final formatted =
         '${picked.hour.toString().padLeft(2, '0')}:${picked.minute.toString().padLeft(2, '0')}';
     setState(() {
@@ -685,6 +686,7 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
     return InkWell(
       onTap: () async {
         final picked = await showTimePicker(context: context, initialTime: value);
+        if (!mounted) return;
         if (picked != null) onPick(picked);
       },
       child: InputDecorator(

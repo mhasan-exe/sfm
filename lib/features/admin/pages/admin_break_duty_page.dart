@@ -306,6 +306,7 @@ class _BreakDutyEditorState extends State<_BreakDutyEditor> {
                               child: OutlinedButton(
                                 onPressed: () async {
                                   final picked = await showTimePicker(context: context, initialTime: _start);
+                                  if (!mounted) return;
                                   if (picked != null) setState(() => _start = picked);
                                 },
                                 child: Text('Start: ${_start.format(context)}'),
@@ -316,6 +317,7 @@ class _BreakDutyEditorState extends State<_BreakDutyEditor> {
                               child: OutlinedButton(
                                 onPressed: () async {
                                   final picked = await showTimePicker(context: context, initialTime: _end);
+                                  if (!mounted) return;
                                   if (picked != null) setState(() => _end = picked);
                                 },
                                 child: Text('End: ${_end.format(context)}'),

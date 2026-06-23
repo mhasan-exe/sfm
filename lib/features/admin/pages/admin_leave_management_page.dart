@@ -93,6 +93,7 @@ class _AdminLeaveManagementPageState extends State<AdminLeaveManagementPage> {
     );
 
     if (reason == null) return; // cancelled
+    if (!mounted) return;
 
     setState(() => _busyIds.add(id));
     try {

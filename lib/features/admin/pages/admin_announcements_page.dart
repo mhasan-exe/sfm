@@ -212,6 +212,7 @@ class _AnnouncementComposerState extends State<_AnnouncementComposer> {
       firstDate: DateTime.now().subtract(const Duration(days: 1)),
       lastDate: DateTime.now().add(const Duration(days: 365)),
     );
+    if (!mounted) return;
     if (picked != null) setState(() => _eventDate = picked);
   }
 
@@ -220,6 +221,7 @@ class _AnnouncementComposerState extends State<_AnnouncementComposer> {
       context: context,
       initialTime: _eventTime ?? TimeOfDay.now(),
     );
+    if (!mounted) return;
     if (picked != null) setState(() => _eventTime = picked);
   }
 

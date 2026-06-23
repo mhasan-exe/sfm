@@ -111,6 +111,7 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
       minute: int.tryParse(parts.length > 1 ? parts[1] : '') ?? 45,
     );
     final picked = await showTimePicker(context: context, initialTime: initial);
+    if (!mounted) return;
     if (picked != null) {
       setState(() {
         unifiedCutoffTime =
