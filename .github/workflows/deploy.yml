@@ -51,16 +51,6 @@ jobs:
         with:
           path: build/web
         
-      - name: Make Android Build
-        run: flutter build apk --release -v
-
-      - name: Upload Android APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-
   deploy:
     environment:
       name: github-pages
