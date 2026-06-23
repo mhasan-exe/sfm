@@ -92,7 +92,9 @@ class _AdminFixtureManagementPageState extends State<AdminFixtureManagementPage>
       builder: (dialogContext) {
         return AlertDialog(
           title: const Text('Assign Fixture'),
-          content: StatefulBuilder(
+          content: SizedBox(
+            width: 440,
+            child: StatefulBuilder(
             builder: (context, setDialogState) {
               final teacherWidgets = teachers.map<Widget>((doc) {
                 final teacher = doc.data();
@@ -146,6 +148,7 @@ class _AdminFixtureManagementPageState extends State<AdminFixtureManagementPage>
                 ),
               );
             },
+          ),
           ),
           actions: [
             TextButton(

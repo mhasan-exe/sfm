@@ -13,6 +13,7 @@ import '../../../core/services/timetable_service.dart';
 import '../../../core/utils/timetable_generator.dart';
 import '../../../core/widgets/app_background.dart';
 import '../../../core/widgets/glass_card.dart';
+import '../../../core/widgets/mouse_wheel_horizontal_scroll.dart';
 import '../../../models/class_model.dart';
 import '../../../models/time_profile_model.dart';
 import '../../../models/timetable_slot_model.dart';
@@ -713,13 +714,27 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
 /// Horizontal strip of draggable teacher chips. Drag one onto any grid cell
 /// (empty or occupied) to assign them — this is the missing "drag" half of
 /// drag-and-drop; the grid cells were already valid [DragTarget]s.
-class _DraggableTeacherRoster extends StatelessWidget {
+class _DraggableTeacherRoster extends StatefulWidget {
   final List<ClassTeacherAssignment> teachers;
 
   const _DraggableTeacherRoster({required this.teachers});
 
   @override
+  State<_DraggableTeacherRoster> createState() => _DraggableTeacherRosterState();
+}
+
+class _DraggableTeacherRosterState extends State<_DraggableTeacherRoster> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final teachers = widget.teachers;
     return ValueListenableBuilder<Map<String, List<BusyBlock>>>(
       valueListenable: TeacherBusyCache.instance.notifier,
       builder: (context, busyMap, _) {
@@ -739,7 +754,10 @@ class _DraggableTeacherRoster extends StatelessWidget {
                 const SizedBox(height: 8),
                 SizedBox(
                   height: 56,
-                  child: ListView.separated(
+                  child: MouseWheelHorizontalScroll(
+                    controller: _scrollController,
+                    child: ListView.separated(
+                    controller: _scrollController,
                     scrollDirection: Axis.horizontal,
                     itemCount: teachers.length,
                     separatorBuilder: (_, __) => const SizedBox(width: 8),
@@ -821,6 +839,7 @@ class _DraggableTeacherRoster extends StatelessWidget {
                       );
                     },
                   ),
+                  ),
                 ),
               ],
             ),
@@ -871,11 +890,18 @@ class _GridBuilderState extends State<_GridBuilder> {
   final _timetable = TimetableService();
   int? _unitsPerDay;
   TimeProfileModel? _timeProfile;
+  final ScrollController _horizontalScrollController = ScrollController();
 
   @override
   void initState() {
     super.initState();
     _loadUnitsPerDay();
+  }
+
+  @override
+  void dispose() {
+    _horizontalScrollController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadUnitsPerDay() async {
@@ -955,7 +981,10 @@ class _GridBuilderState extends State<_GridBuilder> {
             final dayColW = isNarrow ? 110.0 : 140.0;
             final unitColW = isNarrow ? 95.0 : 110.0;
 
-            return SingleChildScrollView(
+            return MouseWheelHorizontalScroll(
+              controller: _horizontalScrollController,
+              child: SingleChildScrollView(
+              controller: _horizontalScrollController,
               scrollDirection: Axis.horizontal,
               child: Container(
                 margin: const EdgeInsets.all(8),
@@ -1102,6 +1131,7 @@ class _GridBuilderState extends State<_GridBuilder> {
                   ),
                 ),
               ),
+            ),
             );
           },
         );

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 
 import '../../core/widgets/glass_card.dart';
+import '../../core/widgets/hover_lift.dart';
 import '../../core/theme/app_theme.dart';
 
 import '../../core/services/admin_config_service.dart';
@@ -182,7 +183,9 @@ class _TeacherCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final total = teacher.defaultUnits + teacher.fixtureUnits;
 
-    return GlassCard(
+    return HoverLift(
+      onTap: () => _showProfileSheet(context),
+      child: GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -274,6 +277,7 @@ class _TeacherCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
       ),
     );
   }

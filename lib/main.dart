@@ -58,17 +58,12 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      debugShowCheckedModeBanner:
-          false,
-
-      title:
-          'AKESP Timetable System',
-
+      debugShowCheckedModeBanner: false,
+      title: 'AKESP Timetable System',
       theme: AppTheme.darkTheme,
-
+      scrollBehavior: AppTheme.scrollBehavior,
       home: const AuthGate(
-        child:
-            MainNavigationScreen(),
+        child: MainNavigationScreen(),
       ),
     );
   }

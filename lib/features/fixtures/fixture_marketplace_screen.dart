@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 
 import '../../core/widgets/glass_card.dart';
+import '../../core/widgets/hover_lift.dart';
 
 import '../../core/theme/app_theme.dart';
 import '../../core/services/fixture_service.dart';
@@ -346,7 +347,8 @@ class _FixtureMarketplaceScreenState extends State<FixtureMarketplaceScreen>
         0;
     final isExpiringSoon = timeUntilExpiry < 10;
 
-    return GlassCard(
+    return HoverLift(
+      child: GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -507,6 +509,7 @@ class _FixtureMarketplaceScreenState extends State<FixtureMarketplaceScreen>
           .animate(delay: Duration(milliseconds: delay))
           .fadeIn(duration: 300.ms)
           .slideY(begin: 10, end: 0),
+      ),
     );
   }
 

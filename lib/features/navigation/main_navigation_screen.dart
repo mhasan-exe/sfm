@@ -140,8 +140,15 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         // Keep selection valid when admin status changes.
         final effectiveIndex = currentIndex.clamp(0, pages.length - 1);
 
-        return AppBackground(
-          child: Stack(
+        return PopScope(
+          canPop: effectiveIndex == 0,
+          onPopInvoked: (didPop) {
+            if (!didPop) {
+              setState(() => currentIndex = 0);
+            }
+          },
+          child: AppBackground(
+            child: Stack(
             children: [
               Scaffold(
                 backgroundColor: Colors.transparent,
@@ -225,6 +232,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               ),
               const AnnouncementPromptOverlay(),
             ],
+            ),
           ),
         );
       },

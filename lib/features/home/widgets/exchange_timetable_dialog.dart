@@ -286,7 +286,7 @@ class _ExchangeTimetableDialogState
                               ),
                             ),
                           );
-                        }),
+                        }).toList(),
                       ],
                     ),
                   );
