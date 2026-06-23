@@ -1,4 +1,3 @@
-import 'clash_handling_mode.dart';
 
 /// Result of a clash-aware teacher assignment attempt.
 class ClashAssignmentOutcome {

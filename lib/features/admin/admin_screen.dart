@@ -26,7 +26,6 @@ import 'pages/admin_config_page.dart';
 import 'pages/admin_presets_page.dart';
 import 'pages/admin_time_profile_page.dart';
 // Bento UI helpers (future migration of remaining widgets)
-import 'widgets/admin_bento.dart';
 
 import 'widgets/admin_dashboard_analytics.dart';
 
@@ -270,17 +269,9 @@ class _AdminScreenState extends State<AdminScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return PopScope(
-      canPop: selectedSidebar == 0,
-      onPopInvoked: (didPop) {
-        if (!didPop) {
-          setState(() => selectedSidebar = 0);
-        }
-      },
-      child: ResponsiveWrapper(
-        mobile: mobileLayout(),
-        desktop: desktopLayout(),
-      ),
+    return ResponsiveWrapper(
+      mobile: mobileLayout(),
+      desktop: desktopLayout(),
     );
   }
 
@@ -658,8 +649,6 @@ class _AdminScreenState extends State<AdminScreen> {
                         padding: const EdgeInsets.only(bottom: 10),
                         child: InkWell(
                           borderRadius: BorderRadius.circular(18),
-                          hoverColor: const Color(0xFF4F8CFF).withValues(alpha: 0.12),
-                          splashColor: const Color(0xFF4F8CFF).withValues(alpha: 0.18),
                           onTap: () {
                             Navigator.maybePop(context);
                             if (index == 6) {
