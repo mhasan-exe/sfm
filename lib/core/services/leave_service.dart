@@ -231,15 +231,23 @@ class LeaveService {
 
     // From here on the approval itself is committed and final — everything
     // below is "apply the consequences of an approval that already
-    // happened", and is safe to retry/best-effort because every write it
-    // makes is idempotent (deterministic doc ids).
-    List<Map<String, dynamic>> vacatedSlots = [];
+    // happened". Every write here is idempotent (deterministic doc ids),
+    // so it's safe to surface failures instead of swallowing them: if this
+    // throws, the leave IS approved (that part already committed above),
+    // but the admin needs to know the schedule wasn't actually vacated so
+    // they can fix the root cause and hit "Resync schedule" — silently
+    // eating the error here is exactly how "leave approved but slots
+    // never emptied, with no error anywhere" bugs happen. The most common
+    // cause: a newly-added collection (`timetable_exceptions`) with no
+    // Firestore security rule yet, so every write to it is silently
+    // rejected as permission-denied unless you've already updated your
+    // rules to allow it.
+    List<Map<String, dynamic>> vacatedSlots;
     try {
       vacatedSlots = await TimetableService().resyncTeacherLeaveExceptions(teacherId);
-    } catch (_) {
-      // Don't let a sync hiccup block the approval itself — the leave is
-      // approved either way; an admin can re-run the sync from the leave
-      // management screen if a slot doesn't show as vacated yet.
+    } catch (e) {
+      throw Exception(
+          'Leave was approved, but the schedule could not be synced (slots may still show the absent teacher): $e\n\nCheck that your Firestore security rules allow writes to the "timetable_exceptions" collection, then use "Resync schedule" for this teacher.');
     }
 
     try {

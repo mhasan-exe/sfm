@@ -1174,7 +1174,128 @@ class TimetableService {
     return TimetableExceptionModel.fromMap(doc.id, doc.data()!);
   }
 
+  // ---------------------------------------------------------------------------
+  // Presets — named snapshots of a class's weekly assignment, restorable
+  // later. Lets an admin safely try a regeneration or a big manual reshuffle
+  // and get back to a known-good schedule with one tap instead of having to
+  // remember/redo every assignment by hand.
+  // ---------------------------------------------------------------------------
 
+  CollectionReference<Map<String, dynamic>> get _presets =>
+      _firestore.collection('timetable_presets');
+
+  /// Snapshots every weekly slot's current teacher for [classId] under
+  /// [name]. Unassigned slots are saved too (as empty), so restoring a
+  /// preset is a true "go back to exactly this" rather than a partial merge.
+  Future<String> saveWeeklyPreset({
+    required String classId,
+    required String name,
+    String? createdBy,
+  }) async {
+    final snap = await _weekly.where('classId', isEqualTo: classId).get();
+    final slots = snap.docs.map((d) {
+      final data = d.data();
+      return {
+        'day': data['day'] ?? '',
+        'unit': data['unit'] ?? 0,
+        'teacherId': data['teacherId'] ?? '',
+        'teacherName': data['teacherName'] ?? '',
+      };
+    }).toList();
+
+    final ref = await _presets.add({
+      'classId': classId,
+      'name': name,
+      'slotCount': slots.length,
+      'slots': slots,
+      'createdAt': FieldValue.serverTimestamp(),
+      'createdBy': createdBy ?? '',
+    });
+
+    await _log('save_timetable_preset', {
+      'classId': classId,
+      'presetId': ref.id,
+      'name': name,
+      'slotCount': slots.length,
+    });
+
+    return ref.id;
+  }
+
+  /// Every saved preset for [classId], newest first.
+  Stream<List<Map<String, dynamic>>> watchPresets(String classId) {
+    return _presets.where('classId', isEqualTo: classId).snapshots().map((snap) {
+      final list = snap.docs.map((d) => {...d.data(), 'id': d.id}).toList();
+      list.sort((a, b) {
+        final ta = a['createdAt'];
+        final tb = b['createdAt'];
+        final da = ta is Timestamp ? ta.toDate() : DateTime.fromMillisecondsSinceEpoch(0);
+        final db = tb is Timestamp ? tb.toDate() : DateTime.fromMillisecondsSinceEpoch(0);
+        return db.compareTo(da);
+      });
+      return list;
+    });
+  }
+
+  Future<void> deletePreset(String presetId) async {
+    await _presets.doc(presetId).delete();
+  }
+
+  /// Overwrites the current weekly assignment for the preset's class with
+  /// whatever was saved in it, then resyncs leave exceptions for every
+  /// teacher touched — both newly-restored ones (so their active leave
+  /// vacates the right slots again) and whoever currently held those slots
+  /// before the restore (so a stale leave exception tied to a teacher who
+  /// no longer teaches that slot doesn't linger as ghost data). This is
+  /// the exact same "diff old vs new assignment, resync both sides" pattern
+  /// used by regeneration and exchanges, applied here too on purpose — a
+  /// restore is just another way a weekly assignment can change.
+  Future<void> restorePreset(String presetId) async {
+    final doc = await _presets.doc(presetId).get();
+    if (!doc.exists) throw Exception('Preset not found');
+    final data = doc.data()!;
+    final classId = (data['classId'] as String?) ?? '';
+    if (classId.isEmpty) throw Exception('Preset is missing its class');
+
+    final currentSnap = await _weekly.where('classId', isEqualTo: classId).get();
+    final previousTeacherIds = currentSnap.docs
+        .map((d) => (d.data()['teacherId'] as String?) ?? '')
+        .toSet();
+
+    final rawSlots = (data['slots'] as List?) ?? const [];
+    const batchLimit = 400;
+    for (var i = 0; i < rawSlots.length; i += batchLimit) {
+      final batch = _firestore.batch();
+      for (final raw in rawSlots.skip(i).take(batchLimit)) {
+        final entry = raw as Map<String, dynamic>;
+        final day = (entry['day'] as String?) ?? '';
+        final unit = (entry['unit'] as num?)?.toInt() ?? 0;
+        if (day.isEmpty || unit <= 0) continue;
+        final id = slotId(classId, day, unit);
+        batch.set(_weekly.doc(id), {
+          'teacherId': entry['teacherId'] ?? '',
+          'teacherName': entry['teacherName'] ?? '',
+          'originalTeacherId': entry['teacherId'] ?? '',
+          'type': 'permanent',
+          'restoredAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
+      await batch.commit();
+    }
+
+    final restoredTeacherIds = rawSlots
+        .map((e) => ((e as Map<String, dynamic>)['teacherId'] as String?) ?? '')
+        .toSet();
+    final affected = <String>{...previousTeacherIds, ...restoredTeacherIds}
+      ..removeWhere((id) => id.isEmpty);
+    await _afterWeeklyAssignmentChanged(affected.toList());
+
+    await _log('restore_timetable_preset', {
+      'classId': classId,
+      'presetId': presetId,
+      'slotCount': rawSlots.length,
+    });
+  }
 
   Future<void> createTimeProfile({
     required String name,

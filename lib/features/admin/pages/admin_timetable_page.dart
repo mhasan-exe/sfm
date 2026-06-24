@@ -75,7 +75,13 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
   final _leaveService = LeaveService();
 
 
-  bool _showDaily = false;
+  // There is no separate "Daily" mode any more — the grid always shows the
+  // permanent weekly pattern with whatever exception (leave/exchange/cover)
+  // applies to the currently-picked date layered on top, live. This flag
+  // stays internally (it's threaded through several widgets below as a
+  // display-only "show the date banner + overlay" switch) but is no longer
+  // user-toggleable.
+  final bool _showDaily = true;
   DateTime _selectedDate = DateTime.now();
 
   bool _showQuotaConfigure = false;
@@ -228,22 +234,157 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
     }
   }
 
-  Widget _buildModeChip() {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        ChoiceChip(
-          label: const Text('Weekly'),
-          selected: !_showDaily,
-          onSelected: (_) => setState(() => _showDaily = false),
-        ),
-        const SizedBox(width: 8),
-        ChoiceChip(
-          label: const Text('Daily'),
-          selected: _showDaily,
-          onSelected: (_) => setState(() => _showDaily = true),
-        ),
-      ],
+  Future<void> _openPresetsDialog(BuildContext context) async {
+    final nameController = TextEditingController();
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF161616),
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 16,
+            bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Presets',
+                  style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 4),
+              const Text(
+                'Save the current weekly schedule, or restore a saved one. Restoring overwrites the live weekly schedule for this class.',
+                style: TextStyle(color: Colors.white60, fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: nameController,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: const InputDecoration(
+                        hintText: 'Preset name (e.g. "Before exams week")',
+                        hintStyle: TextStyle(color: Colors.white38),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: () async {
+                      final name = nameController.text.trim();
+                      if (name.isEmpty) return;
+                      try {
+                        await _timetable.saveWeeklyPreset(
+                          classId: widget.classId,
+                          name: name,
+                        );
+                        if (sheetContext.mounted) {
+                          ScaffoldMessenger.of(sheetContext).showSnackBar(
+                            SnackBar(content: Text('Saved preset "$name"')),
+                          );
+                        }
+                        nameController.clear();
+                      } catch (e) {
+                        if (sheetContext.mounted) {
+                          ScaffoldMessenger.of(sheetContext).showSnackBar(
+                            SnackBar(content: Text('Could not save preset: $e')),
+                          );
+                        }
+                      }
+                    },
+                    child: const Text('Save'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 320),
+                child: StreamBuilder<List<Map<String, dynamic>>>(
+                  stream: _timetable.watchPresets(widget.classId),
+                  builder: (context, snap) {
+                    final presets = snap.data ?? const [];
+                    if (presets.isEmpty) {
+                      return const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 12),
+                        child: Text('No presets saved yet.', style: TextStyle(color: Colors.white38)),
+                      );
+                    }
+                    return ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: presets.length,
+                      itemBuilder: (context, i) {
+                        final preset = presets[i];
+                        final ts = preset['createdAt'];
+                        final dt = ts is Timestamp ? ts.toDate() : null;
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(preset['name']?.toString() ?? 'Untitled',
+                              style: const TextStyle(color: Colors.white)),
+                          subtitle: Text(
+                            '${preset['slotCount'] ?? 0} slot(s)${dt != null ? ' • ${DateFormat('MMM d, yyyy h:mm a').format(dt)}' : ''}',
+                            style: const TextStyle(color: Colors.white38, fontSize: 12),
+                          ),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.restore, color: Colors.orange),
+                                tooltip: 'Restore',
+                                onPressed: () async {
+                                  final confirmed = await showDialog<bool>(
+                                    context: context,
+                                    builder: (ctx) => AlertDialog(
+                                      title: const Text('Restore this preset?'),
+                                      content: Text(
+                                          'This overwrites the current weekly schedule for this class with "${preset['name']}". This cannot be undone (unless you save another preset first).'),
+                                      actions: [
+                                        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                                        ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Restore')),
+                                      ],
+                                    ),
+                                  );
+                                  if (confirmed != true) return;
+                                  try {
+                                    await _timetable.restorePreset(preset['id'] as String);
+                                    if (context.mounted) {
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(content: Text('Preset restored.')),
+                                      );
+                                    }
+                                  } catch (e) {
+                                    if (context.mounted) {
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        SnackBar(content: Text('Could not restore preset: $e')),
+                                      );
+                                    }
+                                  }
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline, color: Colors.white38),
+                                tooltip: 'Delete',
+                                onPressed: () async {
+                                  try {
+                                    await _timetable.deletePreset(preset['id'] as String);
+                                  } catch (_) {}
+                                },
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -253,7 +394,14 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
       child: Scaffold(
         backgroundColor: Colors.transparent,
         appBar: AppBar(
-          title: const Text('Admin Timetable (Weekly + Daily)'),
+          title: const Text('Admin Timetable'),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.bookmarks_outlined),
+              tooltip: 'Presets',
+              onPressed: () => _openPresetsDialog(context),
+            ),
+          ],
         ),
         body: LayoutBuilder(
           builder: (context, constraints) {
@@ -266,37 +414,14 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                 children: [
                 Padding(
                   padding: EdgeInsets.fromLTRB(sidePad, topPad, sidePad, 8),
-                  child: narrow
-                      ? Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Class: ${widget.classId}',
-                              style: Theme.of(context).textTheme.titleMedium,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            const SizedBox(height: 10),
-                            Align(
-                              alignment: Alignment.centerLeft,
-                              child: _buildModeChip(),
-                            ),
-                          ],
-                        )
-                      : Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                'Class: ${widget.classId}',
-                                style: Theme.of(context).textTheme.titleLarge,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            _buildModeChip(),
-                          ],
-                        ),
+                  child: Text(
+                    'Class: ${widget.classId}',
+                    style: narrow
+                        ? Theme.of(context).textTheme.titleMedium
+                        : Theme.of(context).textTheme.titleLarge,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
 
                 if (_showDaily)
@@ -309,7 +434,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                           children: [
                             Expanded(
                               child: Text(
-                                'Daily view for ${DateFormat('EEE, MMM dd').format(_selectedDate)}',
+                                'Showing: ${DateFormat('EEE, MMM dd').format(_selectedDate)}',
                                 style: Theme.of(context).textTheme.bodyLarge,
                               ),
                             ),
@@ -345,7 +470,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                         vertical: 10,
                       ),
                       child: Text(
-                        'Permanent changes are always saved to Weekly. Daily shows the effective schedule for the picked date — leave, exchanges and fixture cover layered on top, computed live.',
+                        'This grid is the weekly schedule. Drag-and-drop edits are permanent. The picked date\'s leave/exchange/cover is layered on top live, just for preview — it never changes the permanent pattern.',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
                     ),

@@ -4,6 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 
 import '../../../core/services/leave_service.dart';
+import '../../../core/services/timetable_service.dart';
 
 /// Admin leave requests — rebuilt deliberately simple after the previous
 /// tabbed version kept breaking. One unfiltered stream of the whole
@@ -53,6 +54,30 @@ class _AdminLeaveManagementPageState extends State<AdminLeaveManagementPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Could not approve: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busyIds.remove(id));
+    }
+  }
+
+  Future<void> _resync(String id, String teacherId, String teacherName) async {
+    setState(() => _busyIds.add(id));
+    try {
+      final vacated = await TimetableService().resyncTeacherLeaveExceptions(teacherId);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(vacated.isEmpty
+                ? 'Resynced — $teacherName has no current/upcoming approved leave overlapping their weekly schedule.'
+                : 'Resynced — ${vacated.length} class unit(s) vacated for $teacherName.'),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Resync failed: $e')),
         );
       }
     } finally {
@@ -237,6 +262,28 @@ class _AdminLeaveManagementPageState extends State<AdminLeaveManagementPage> {
                         Text(
                           'Reason for rejection: $rejectionReason',
                           style: const TextStyle(color: Color(0xFFF87171), fontSize: 13),
+                        ),
+                      ],
+                      if (status == 'approved') ...[
+                        const SizedBox(height: 10),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: OutlinedButton.icon(
+                            onPressed: isBusy
+                                ? null
+                                : () => _resync(
+                                      id,
+                                      (data['teacherId'] as String?) ?? '',
+                                      teacherName,
+                                    ),
+                            icon: const Icon(Icons.sync, size: 16),
+                            label: const Text('Resync schedule'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                              side: const BorderSide(color: Colors.white24),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                            ),
+                          ),
                         ),
                       ],
                       if (status == 'pending') ...[
