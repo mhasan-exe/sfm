@@ -326,9 +326,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                                 if (picked == null) return;
                                 if (!mounted) return;
                                 setState(() => _selectedDate = picked);
-                                await _materializeDailyForSelectedDate();
-                                if (!mounted) return;
-                                setState(() {});
                               },
                               icon: const Icon(Icons.calendar_month),
                               label: const Text('Pick date'),
