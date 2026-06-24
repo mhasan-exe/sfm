@@ -117,10 +117,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
       details: {'classId': widget.classId},
     );
 
-    if (_showDaily && mounted) {
-      await _materializeDailyForSelectedDate();
-    }
-
     return outcome;
   }
 
@@ -145,35 +141,13 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
     }
   }
 
-  Future<void> _onRefreshDailyPressed(BuildContext context) async {
-    try {
-      await _materializeDailyForSelectedDate();
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Daily materialized')),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Daily materialization failed: $e')),
-      );
-    }
+  Future<void> _onRefreshViewPressed(BuildContext context) async {
+    // Exceptions are written the moment a leave is approved, an exchange is
+    // confirmed, or a fixture is covered — there is no "materialize daily"
+    // step to run any more (the old `daily_timetables` collection this used
+    // to build is gone). This button now just nudges a rebuild, which is
+    // occasionally useful right after another admin's change.
     if (mounted) setState(() {});
-  }
-
-  Future<void> _materializeDailyForSelectedDate() async {
-    await _timetable.generateDailyForDate(
-      _selectedDate,
-      classId: widget.classId,
-    );
-
-    await _audit.log(
-      action: 'materialize_daily_timetable',
-      details: {
-        'classId': widget.classId,
-        'date': DateFormat('yyyy-MM-dd').format(_selectedDate),
-      },
-    );
   }
 
   String get _dateKey => DateFormat('yyyy-MM-dd').format(_selectedDate);
@@ -232,10 +206,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
         classId: widget.classId,
       );
 
-      if (_showDaily && mounted) {
-        await _materializeDailyForSelectedDate();
-      }
-
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -271,12 +241,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
         ChoiceChip(
           label: const Text('Daily'),
           selected: _showDaily,
-          onSelected: (_) async {
-            setState(() => _showDaily = true);
-            await _materializeDailyForSelectedDate();
-            if (!mounted) return;
-            setState(() {});
-          },
+          onSelected: (_) => setState(() => _showDaily = true),
         ),
       ],
     );
@@ -383,7 +348,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                         vertical: 10,
                       ),
                       child: Text(
-                        'Permanent changes are always saved to Weekly Timetables. Daily is materialized for viewing & temporary overrides.',
+                        'Permanent changes are always saved to Weekly. Daily shows the effective schedule for the picked date — leave, exchanges and fixture cover layered on top, computed live.',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
                     ),
@@ -417,7 +382,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                                 if (_showDaily)
                                   Expanded(
                                     child: ElevatedButton.icon(
-                                      onPressed: () => _onRefreshDailyPressed(context),
+                                      onPressed: () => _onRefreshViewPressed(context),
                                       icon: const Icon(Icons.refresh),
                                       label: const Text('Refresh'),
                                     ),
@@ -447,9 +412,9 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                             if (_showDaily) const SizedBox(width: 4),
                             if (_showDaily)
                               ElevatedButton.icon(
-                                onPressed: () => _onRefreshDailyPressed(context),
+                                onPressed: () => _onRefreshViewPressed(context),
                                 icon: const Icon(Icons.refresh),
-                                label: const Text('Refresh Daily'),
+                                label: const Text('Refresh'),
                               ),
                           ],
                         ),
@@ -895,15 +860,69 @@ class _GridBuilderState extends State<_GridBuilder> {
 
 
 
-  Stream<QuerySnapshot<Map<String, dynamic>>> _buildStream() {
-    final base = FirebaseFirestore.instance
-        .collection(widget.showDaily ? 'daily_timetables' : 'weekly_timetables')
-        .where('classId', isEqualTo: widget.classId);
+  /// REPLACES the old "query a separate `daily_timetables` collection"
+  /// stream. There is no materialized daily collection any more — instead
+  /// this merges the live weekly stream with the live exceptions-for-date
+  /// stream and overlays one onto the other, exactly like the teacher's own
+  /// "today" view does. Important: the merged list's doc ids are still the
+  /// WEEKLY slot ids (never an exception id) — every assignment action in
+  /// this file independently recomputes `TimetableService().slotId(...)`
+  /// before writing, so this is purely a *display* concern.
+  Stream<List<TimetableSlotModel>> _buildStream() {
+    final weekly = FirebaseFirestore.instance
+        .collection('weekly_timetables')
+        .where('classId', isEqualTo: widget.classId)
+        .snapshots();
 
-    if (widget.showDaily) {
-      return base.where('date', isEqualTo: widget.selectedDateKey).snapshots();
+    if (!widget.showDaily) {
+      return weekly.map((snap) => snap.docs
+          .map((d) => TimetableSlotModel.fromMap(d.id, d.data()))
+          .toList());
     }
-    return base.snapshots();
+
+    final exceptions = FirebaseFirestore.instance
+        .collection('timetable_exceptions')
+        .where('classId', isEqualTo: widget.classId)
+        .where('date', isEqualTo: widget.selectedDateKey)
+        .snapshots();
+
+    return Stream.multi((sink) {
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> weeklyDocs = [];
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> excDocs = [];
+
+      void emit() {
+        final excBySlotId = <String, Map<String, dynamic>>{};
+        for (final d in excDocs) {
+          final data = d.data();
+          excBySlotId[(data['slotId'] as String?) ?? d.id] = data;
+        }
+        final merged = weeklyDocs.map((d) {
+          final base = TimetableSlotModel.fromMap(d.id, d.data());
+          final exc = excBySlotId[d.id];
+          if (exc == null) return base;
+          return base.copyWith(
+            teacherId: (exc['teacherId'] as String?) ?? '',
+            teacherName: (exc['teacherName'] as String?) ?? '',
+            type: (exc['type'] as String?) ?? base.type,
+          );
+        }).toList();
+        sink.add(merged);
+      }
+
+      final s1 = weekly.listen((snap) {
+        weeklyDocs = snap.docs;
+        emit();
+      }, onError: sink.addError);
+      final s2 = exceptions.listen((snap) {
+        excDocs = snap.docs;
+        emit();
+      }, onError: sink.addError);
+
+      sink.onCancel = () async {
+        await s1.cancel();
+        await s2.cancel();
+      };
+    });
   }
 
   @override
@@ -917,7 +936,7 @@ class _GridBuilderState extends State<_GridBuilder> {
       'Saturday',
     ];
 
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+    return StreamBuilder<List<TimetableSlotModel>>(
       stream: _buildStream(),
 
       builder: (context, snapshot) {
@@ -925,14 +944,10 @@ class _GridBuilderState extends State<_GridBuilder> {
           return const Center(child: CircularProgressIndicator());
         }
 
-        final docs = snapshot.data!.docs;
-        if (docs.isEmpty) {
+        final slots = snapshot.data!;
+        if (slots.isEmpty) {
           return const Center(child: Text('No timetable slots found'));
         }
-
-        final slots = docs
-            .map((d) => TimetableSlotModel.fromMap(d.id, d.data()))
-            .toList();
 
         final maxUnitFromDocs =
             slots.map((s) => s.unit).fold<int>(0, (p, c) => c > p ? c : p);
@@ -1130,8 +1145,6 @@ class _EmptySlotCell extends StatelessWidget {
     this.endTime = '',
   });
 
-  bool _isUnitOneClassTeacherOnly() => unit == 1;
-
   Future<void> _assign(BuildContext context) async {
     final selectedTeacherId = await showDialog<String>(
       context: context,
@@ -1153,24 +1166,10 @@ class _EmptySlotCell extends StatelessWidget {
     BuildContext context,
     String draggedTeacherId, {
     bool overrideQuota = false,
+    bool allowLeaveOverride = false,
+    bool bypassFirstUnitProtection = false,
   }) async {
     if (draggedTeacherId.isEmpty) return;
-
-    if (_isUnitOneClassTeacherOnly()) {
-      final cls = await TimetableService().getClass(classId);
-      final classTeachers = cls?.teachers.where((t) => t.isClassTeacher).toList();
-      final allowedTeacherId = (classTeachers == null || classTeachers.isEmpty)
-          ? null
-          : classTeachers.first.teacherId;
-
-      if (allowedTeacherId != null && draggedTeacherId != allowedTeacherId) {
-        if (!context.mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Unit 1 requires the class teacher.')),
-        );
-        return;
-      }
-    }
 
     final weeklySlotId = TimetableService().slotId(classId, day, unit);
     try {
@@ -1180,7 +1179,59 @@ class _EmptySlotCell extends StatelessWidget {
         draggedTeacherId: draggedTeacherId,
         mode: ClashHandlingMode.rollback,
         overrideQuota: overrideQuota,
+        allowLeaveOverride: allowLeaveOverride,
+        bypassFirstUnitProtection: bypassFirstUnitProtection,
       );
+
+      // Unit 1 is reserved for the class teacher. Admin-only bypass, with
+      // an explicit warning — never a silent block, never automatic.
+      if (!outcome.assigned && outcome.firstUnitConflict && context.mounted) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Unit 1 is reserved for the class teacher'),
+            content: Text('${outcome.warnings.join('\n')}\n\nAssign anyway?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Assign anyway'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed == true && context.mounted) {
+          await _performAssign(context, draggedTeacherId, bypassFirstUnitProtection: true);
+        }
+        return;
+      }
+
+      // Approved leave covers a future occurrence of this slot. Automation
+      // never reaches this path at all (see TimetableService docs) — this
+      // is strictly the manual "admin assigns anyway" warning, and even
+      // after confirming, the teacher's leave dates stay vacated for cover.
+      if (!outcome.assigned && outcome.leaveConflict && context.mounted) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Teacher has approved leave'),
+            content: Text('${outcome.warnings.join('\n')}\n\nAssign anyway?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Assign anyway'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed == true && context.mounted) {
+          await _performAssign(context, draggedTeacherId, allowLeaveOverride: true);
+        }
+        return;
+      }
 
       if (!outcome.assigned && outcome.quotaExceeded && context.mounted) {
         final confirmed = await showDialog<bool>(
@@ -1295,7 +1346,12 @@ class _SlotCell extends StatefulWidget {
 }
 
 class _SlotCellState extends State<_SlotCell> {
-  Future<void> _performAssign(String draggedTeacherId, {bool overrideQuota = false}) async {
+  Future<void> _performAssign(
+    String draggedTeacherId, {
+    bool overrideQuota = false,
+    bool allowLeaveOverride = false,
+    bool bypassFirstUnitProtection = false,
+  }) async {
     if (draggedTeacherId.isEmpty) return;
 
     final destinationWeeklySlotId = TimetableService().slotId(
@@ -1311,7 +1367,53 @@ class _SlotCellState extends State<_SlotCell> {
         draggedTeacherId: draggedTeacherId,
         mode: ClashHandlingMode.rollback,
         overrideQuota: overrideQuota,
+        allowLeaveOverride: allowLeaveOverride,
+        bypassFirstUnitProtection: bypassFirstUnitProtection,
       );
+
+      if (!outcome.assigned && outcome.firstUnitConflict && mounted) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Unit 1 is reserved for the class teacher'),
+            content: Text('${outcome.warnings.join('\n')}\n\nAssign anyway?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Assign anyway'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed == true) {
+          await _performAssign(draggedTeacherId, bypassFirstUnitProtection: true);
+        }
+        return;
+      }
+
+      if (!outcome.assigned && outcome.leaveConflict && mounted) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Teacher has approved leave'),
+            content: Text('${outcome.warnings.join('\n')}\n\nAssign anyway?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Assign anyway'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed == true) {
+          await _performAssign(draggedTeacherId, allowLeaveOverride: true);
+        }
+        return;
+      }
 
       if (!outcome.assigned && outcome.quotaExceeded && mounted) {
         final confirmed = await showDialog<bool>(
@@ -1497,12 +1599,22 @@ class _SlotEditSheetState extends State<_SlotEditSheet> {
     );
 
     try {
-      await _teacherService.assignTeacherWithClashHandling(
+      final outcome = await _teacherService.assignTeacherWithClashHandling(
         classId: widget.classId,
         destinationSlotId: weeklySlotId,
         draggedTeacherId: teacherId,
         mode: ClashHandlingMode.rollback,
       );
+      if (!outcome.assigned) {
+        if (!mounted) return;
+        final extra = (outcome.leaveConflict || outcome.firstUnitConflict || outcome.quotaExceeded)
+            ? ' Use the grid\'s drag-and-drop assignment instead — it offers an "assign anyway" override for this.'
+            : '';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${outcome.warnings.join('\n')}$extra')),
+        );
+        return;
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

@@ -10,6 +10,7 @@ import 'notification_service.dart';
 
 import '../../models/class_model.dart';
 import '../../models/timetable_slot_model.dart';
+import '../../models/timetable_exception_model.dart';
 
 import '../../models/time_profile_model.dart';
 
@@ -25,6 +26,21 @@ class GenerationOutcome {
   });
 }
 
+/// One weekly slot merged with whatever exception applies to it on a
+/// specific date — what a UI should actually render for "today"/"this
+/// date", without ever needing a second materialized copy of the schedule.
+class EffectiveSlot {
+  final TimetableSlotModel weekly;
+  final TimetableExceptionModel? exception;
+
+  const EffectiveSlot({required this.weekly, this.exception});
+
+  String get teacherId => exception?.teacherId ?? weekly.teacherId;
+  String get teacherName => exception?.teacherName ?? weekly.teacherName;
+  bool get isException => exception != null;
+  String get effectiveType => exception?.type ?? weekly.type;
+}
+
 class TimetableService {
   final FirebaseFirestore _firestore;
   final AuditLogService _auditLogService;
@@ -35,13 +51,28 @@ class TimetableService {
 
   CollectionReference<Map<String, dynamic>> get _weekly =>
       _firestore.collection('weekly_timetables');
-  CollectionReference<Map<String, dynamic>> get _daily =>
-      _firestore.collection('daily_timetables');
+
+  /// Sparse per-date deviations. REPLACES the old `daily_timetables`
+  /// collection — see TimetableExceptionModel for why.
+  CollectionReference<Map<String, dynamic>> get _exceptions =>
+      _firestore.collection('timetable_exceptions');
+
   CollectionReference<Map<String, dynamic>> get _classes =>
       _firestore.collection('classes');
 
   String slotId(String classId, String day, int unit) =>
       '${classId}_${day}_$unit';
+
+  /// Deterministic exception doc id for (slot, date). Deterministic IDs are
+  /// what make every exception write idempotent: approving the same leave
+  /// twice, a retried write after a dropped connection, or two admins
+  /// approving the same request at once can never create two different
+  /// documents for the same slot+date — the second write just overwrites
+  /// the first with identical data.
+  String exceptionId(String slotId, String dateKey) => '${slotId}_$dateKey';
+
+  String dateKeyFor(DateTime date) =>
+      '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
 
   // ---------------------------------------------------------------------------
   // Reads
@@ -67,6 +98,70 @@ class TimetableService {
         .map((snap) => snap.docs
             .map((d) => TimetableSlotModel.fromMap(d.id, d.data()))
             .toList());
+  }
+
+  /// Every exception for a given calendar date, optionally restricted to one
+  /// class. This is the ONLY thing a UI needs (on top of the weekly stream)
+  /// to render "today" / "this specific date" correctly — no materialization
+  /// step required, because exceptions are written the moment they happen
+  /// (leave approved, exchange confirmed, fixture covered).
+  Stream<List<TimetableExceptionModel>> streamExceptionsForDate(
+    String dateKey, {
+    String? classId,
+  }) {
+    Query<Map<String, dynamic>> q = _exceptions.where('date', isEqualTo: dateKey);
+    if (classId != null) q = q.where('classId', isEqualTo: classId);
+    return q.snapshots().map((snap) => snap.docs
+        .map((d) => TimetableExceptionModel.fromMap(d.id, d.data()))
+        .toList());
+  }
+
+  /// Every exception that affects [teacherId] on [dateKey] — either because
+  /// it's normally their slot (originalTeacherId) or because they're now
+  /// covering it (teacherId). Queried as two separate equality filters and
+  /// merged client-side on purpose: a single `where` on `originalTeacherId`
+  /// alone would miss cover assignments, and querying by the *current*
+  /// `teacherId` alone is exactly the bug this replaces — that field goes
+  /// blank the instant a slot is vacated, so the affected teacher's own
+  /// view would stop showing their own vacancy.
+  Stream<List<TimetableExceptionModel>> streamExceptionsForTeacherDate(
+    String teacherId,
+    String dateKey,
+  ) {
+    final ownStream = _exceptions
+        .where('date', isEqualTo: dateKey)
+        .where('originalTeacherId', isEqualTo: teacherId)
+        .snapshots();
+    final coveringStream = _exceptions
+        .where('date', isEqualTo: dateKey)
+        .where('teacherId', isEqualTo: teacherId)
+        .snapshots();
+
+    return Stream.multi((sink) {
+      List<TimetableExceptionModel> own = [];
+      List<TimetableExceptionModel> covering = [];
+
+      void emit() {
+        final byId = <String, TimetableExceptionModel>{};
+        for (final e in own) byId[e.id] = e;
+        for (final e in covering) byId[e.id] = e;
+        sink.add(byId.values.toList());
+      }
+
+      final s1 = ownStream.listen((snap) {
+        own = snap.docs.map((d) => TimetableExceptionModel.fromMap(d.id, d.data())).toList();
+        emit();
+      }, onError: sink.addError);
+      final s2 = coveringStream.listen((snap) {
+        covering = snap.docs.map((d) => TimetableExceptionModel.fromMap(d.id, d.data())).toList();
+        emit();
+      }, onError: sink.addError);
+
+      sink.onCancel = () async {
+        await s1.cancel();
+        await s2.cancel();
+      };
+    });
   }
 
   Future<ClassModel?> getClass(String classId) async {
@@ -206,6 +301,53 @@ class TimetableService {
   }
 
   // ---------------------------------------------------------------------------
+  // Leave-conflict / first-unit-protection guard rails
+  // ---------------------------------------------------------------------------
+
+  /// True if [teacherId] has an approved leave overlapping any future (or
+  /// today's) occurrence of [day] within the next [horizonDays] — i.e.
+  /// assigning them to this weekly slot would immediately get auto-vacated
+  /// for at least one upcoming date. Used to warn before a *permanent*
+  /// weekly assignment is made into a teacher who's currently on leave.
+  Future<List<DateTime>> _upcomingLeaveDatesForDay({
+    required String teacherId,
+    required String day,
+    int horizonDays = 60,
+  }) async {
+    if (teacherId.isEmpty) return const [];
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final horizon = today.add(Duration(days: horizonDays));
+
+    final snap = await _firestore
+        .collection('leave_requests')
+        .where('teacherId', isEqualTo: teacherId)
+        .where('status', isEqualTo: 'approved')
+        .get();
+
+    final hits = <DateTime>[];
+    for (final doc in snap.docs) {
+      final data = doc.data();
+      final start = (data['startDate'] as Timestamp?)?.toDate();
+      final end = (data['endDate'] as Timestamp?)?.toDate();
+      if (start == null || end == null) continue;
+
+      var cursor = DateTime(start.year, start.month, start.day);
+      final last = DateTime(end.year, end.month, end.day);
+      if (last.isBefore(today)) continue; // leave already fully in the past
+
+      while (!cursor.isAfter(last) && !cursor.isAfter(horizon)) {
+        if (!cursor.isBefore(today) && dayNameForDate(cursor) == day) {
+          hits.add(cursor);
+        }
+        cursor = cursor.add(const Duration(days: 1));
+      }
+    }
+    hits.sort();
+    return hits;
+  }
+
+  // ---------------------------------------------------------------------------
   // Drag/drop clash-aware assignment
   // ---------------------------------------------------------------------------
 
@@ -215,6 +357,8 @@ class TimetableService {
     required String draggedTeacherId,
     required ClashHandlingMode mode,
     bool overrideQuota = false,
+    bool allowLeaveOverride = false,
+    bool bypassFirstUnitProtection = false,
   }) async {
     if (draggedTeacherId.isEmpty) {
       return const ClashAssignmentOutcome(assigned: false, warnings: []);
@@ -232,6 +376,51 @@ class TimetableService {
     final destUnitNum = (dest['unit'] as num?)?.toInt() ?? 0;
     if (destDay.isEmpty || destUnitNum <= 0) {
       throw Exception('Destination slot missing day/unit: $destinationSlotId');
+    }
+
+    // ---------------------------------------------------------------
+    // Guard rail: unit 1 reserved for the class teacher. Manual admin
+    // action only — bypassFirstUnitProtection:true, with a warning.
+    // ---------------------------------------------------------------
+    if (destUnitNum == 1 && !bypassFirstUnitProtection) {
+      final protectFirstUnit =
+          await AdminConfigService().getProtectFirstUnitForClassTeacher();
+      if (protectFirstUnit) {
+        final cls = await getClass(classId);
+        final classTeacherId = cls?.classTeacherId ?? '';
+        if (classTeacherId.isNotEmpty && classTeacherId != draggedTeacherId) {
+          return ClashAssignmentOutcome(
+            assigned: false,
+            warnings: [
+              'Unit 1 is reserved for the class teacher (${cls?.classTeacherName ?? classTeacherId}).',
+            ],
+            firstUnitConflict: true,
+          );
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Guard rail: approved leave. Automation must NEVER push through this
+    // — only a manual admin "assign anyway" (allowLeaveOverride:true) may,
+    // and even then the leave's own dates stay vacated afterwards (see
+    // resyncTeacherLeaveExceptions, called below once assignment commits).
+    // ---------------------------------------------------------------
+    if (!allowLeaveOverride) {
+      final leaveDates = await _upcomingLeaveDatesForDay(
+        teacherId: draggedTeacherId,
+        day: destDay,
+      );
+      if (leaveDates.isNotEmpty) {
+        final preview = leaveDates.take(3).map(dateKeyFor).join(', ');
+        return ClashAssignmentOutcome(
+          assigned: false,
+          warnings: [
+            '${draggedTeacherName.isEmpty ? draggedTeacherId : draggedTeacherName} has approved leave covering this day ($preview${leaveDates.length > 3 ? ', …' : ''}). Those dates will stay vacated for cover even if you assign them permanently.',
+          ],
+          leaveConflict: true,
+        );
+      }
     }
 
     final busySlotsSnap = await _weekly
@@ -337,6 +526,7 @@ class TimetableService {
             teacherId: draggedTeacherId,
             teacherName: draggedTeacherName,
           );
+          await _afterWeeklyAssignmentChanged([draggedTeacherId]);
           return ClashAssignmentOutcome(assigned: true, warnings: warnings);
         case ClashHandlingMode.autoFindNonClashing:
           final clearedAny = await _tryAutoResolveClash(
@@ -350,6 +540,7 @@ class TimetableService {
               teacherId: draggedTeacherId,
               teacherName: draggedTeacherName,
             );
+            await _afterWeeklyAssignmentChanged([draggedTeacherId]);
             return const ClashAssignmentOutcome(assigned: true, warnings: []);
           }
           return ClashAssignmentOutcome(assigned: false, warnings: warnings);
@@ -368,11 +559,16 @@ class TimetableService {
       softWarnings.add(quotaWarning);
     }
 
+    // Capture who was previously assigned BEFORE overwriting, so their
+    // stale exceptions can be resynced too (see _afterWeeklyAssignmentChanged).
+    final previousTeacherId = (dest['teacherId'] as String?) ?? '';
+
     await assignTeacher(
       slotId: destinationSlotId,
       teacherId: draggedTeacherId,
       teacherName: draggedTeacherName,
     );
+    await _afterWeeklyAssignmentChanged([draggedTeacherId, previousTeacherId]);
 
     await _log('assign_teacher', {
       'classId': classId,
@@ -433,6 +629,9 @@ class TimetableService {
     final ref1 = _weekly.doc(slotId1);
     final ref2 = _weekly.doc(slotId2);
 
+    String teacher1 = '';
+    String teacher2 = '';
+
     await _firestore.runTransaction((tx) async {
       final s1 = await tx.get(ref1);
       final s2 = await tx.get(ref2);
@@ -441,6 +640,8 @@ class TimetableService {
       }
       final d1 = s1.data()!;
       final d2 = s2.data()!;
+      teacher1 = (d1['teacherId'] as String?) ?? '';
+      teacher2 = (d2['teacherId'] as String?) ?? '';
 
       tx.update(ref1, {
         'teacherId': d2['teacherId'] ?? '',
@@ -455,62 +656,121 @@ class TimetableService {
         'exchangedAt': FieldValue.serverTimestamp(),
       });
     });
+
+    // Both teachers' day/unit ownership just changed permanently — make
+    // sure any leave-driven exceptions tied to their OLD slots are
+    // re-validated against their new weekly reality.
+    await _afterWeeklyAssignmentChanged([teacher1, teacher2]);
   }
 
-  /// Same-day teacher exchange that touches ONLY the daily timetable for
-  /// that one date — the recurring weekly template is never modified.
-  /// Tomorrow, the weekly pattern (and therefore tomorrow's daily
-  /// schedule) is back to normal automatically. This is the correct
-  /// "today-only swap" behaviour; [exchangeSlots] permanently rewrites the
-  /// weekly template and should only be used by admin-driven permanent
-  /// timetable edits, never by a teacher's own same-day exchange request.
-  Future<void> exchangeDailySlots({
-    required String dailySlotId1,
-    required String dailySlotId2,
+  /// Same-day, single-date swap between two slots' EFFECTIVE assignment for
+  /// [date] only — the permanent weekly template is never touched. This
+  /// REPLACES the old `exchangeDailySlots`, which used to write into the
+  /// `daily_timetables` collection; it now writes two 'exchange'
+  /// [TimetableExceptionModel] docs instead. Tomorrow, the weekly pattern
+  /// (and therefore tomorrow's effective schedule) is unaffected.
+  ///
+  /// Neither slot may be locked by an approved-leave exception for [date] —
+  /// a teacher's own same-day exchange must never be able to override a
+  /// leave (only a manual admin override elsewhere can).
+  Future<void> exchangeForDate({
+    required String weeklySlotId1,
+    required String weeklySlotId2,
+    required DateTime date,
   }) async {
-    if (dailySlotId1 == dailySlotId2) return;
-    final ref1 = _daily.doc(dailySlotId1);
-    final ref2 = _daily.doc(dailySlotId2);
+    if (weeklySlotId1 == weeklySlotId2) return;
+    final dateKey = dateKeyFor(date);
+    final ref1 = _weekly.doc(weeklySlotId1);
+    final ref2 = _weekly.doc(weeklySlotId2);
+    final excRef1 = _exceptions.doc(exceptionId(weeklySlotId1, dateKey));
+    final excRef2 = _exceptions.doc(exceptionId(weeklySlotId2, dateKey));
 
-    Map<String, dynamic>? d1;
-    Map<String, dynamic>? d2;
+    Map<String, dynamic>? notifyD1;
+    Map<String, dynamic>? notifyD2;
+    String notifyTeacher1 = '';
+    String notifyTeacher2 = '';
+
     await _firestore.runTransaction((tx) async {
       final s1 = await tx.get(ref1);
       final s2 = await tx.get(ref2);
       if (!s1.exists || !s2.exists) {
         throw Exception('One of the slots no longer exists.');
       }
-      d1 = s1.data()!;
-      d2 = s2.data()!;
+      final exc1 = await tx.get(excRef1);
+      final exc2 = await tx.get(excRef2);
 
-      tx.update(ref1, {
-        'teacherId': d2!['teacherId'] ?? '',
-        'teacherName': d2!['teacherName'] ?? '',
-        'type': 'override',
-        'exchangedAt': FieldValue.serverTimestamp(),
+      if ((exc1.exists && exc1.data()?['type'] == 'leave') ||
+          (exc2.exists && exc2.data()?['type'] == 'leave')) {
+        throw Exception(
+            'One of these slots is vacated by approved leave on this date and cannot be exchanged.');
+      }
+
+      final d1 = s1.data()!;
+      final d2 = s2.data()!;
+
+      // Effective (weekly, unless an existing non-leave exception already
+      // overrides it for this date) teacher for each side.
+      final eff1TeacherId = exc1.exists ? (exc1.data()?['teacherId'] as String? ?? '') : (d1['teacherId'] as String? ?? '');
+      final eff1TeacherName = exc1.exists ? (exc1.data()?['teacherName'] as String? ?? '') : (d1['teacherName'] as String? ?? '');
+      final eff2TeacherId = exc2.exists ? (exc2.data()?['teacherId'] as String? ?? '') : (d2['teacherId'] as String? ?? '');
+      final eff2TeacherName = exc2.exists ? (exc2.data()?['teacherName'] as String? ?? '') : (d2['teacherName'] as String? ?? '');
+
+      tx.set(excRef1, {
+        'slotId': weeklySlotId1,
+        'classId': d1['classId'] ?? '',
+        'className': d1['className'] ?? '',
+        'day': d1['day'] ?? '',
+        'unit': d1['unit'] ?? 0,
+        'startTime': d1['startTime'] ?? '',
+        'endTime': d1['endTime'] ?? '',
+        'date': dateKey,
+        'type': 'exchange',
+        'teacherId': eff2TeacherId,
+        'teacherName': eff2TeacherName,
+        'originalTeacherId': d1['teacherId'] ?? '',
+        'originalTeacherName': d1['teacherName'] ?? '',
+        'sourceId': '',
+        'updatedAt': FieldValue.serverTimestamp(),
       });
-      tx.update(ref2, {
-        'teacherId': d1!['teacherId'] ?? '',
-        'teacherName': d1!['teacherName'] ?? '',
-        'type': 'override',
-        'exchangedAt': FieldValue.serverTimestamp(),
+      tx.set(excRef2, {
+        'slotId': weeklySlotId2,
+        'classId': d2['classId'] ?? '',
+        'className': d2['className'] ?? '',
+        'day': d2['day'] ?? '',
+        'unit': d2['unit'] ?? 0,
+        'startTime': d2['startTime'] ?? '',
+        'endTime': d2['endTime'] ?? '',
+        'date': dateKey,
+        'type': 'exchange',
+        'teacherId': eff1TeacherId,
+        'teacherName': eff1TeacherName,
+        'originalTeacherId': d2['teacherId'] ?? '',
+        'originalTeacherName': d2['teacherName'] ?? '',
+        'sourceId': '',
+        'updatedAt': FieldValue.serverTimestamp(),
       });
+
+      notifyD1 = d1;
+      notifyD2 = d2;
+      notifyTeacher1 = eff2TeacherId;
+      notifyTeacher2 = eff1TeacherId;
     });
 
-    // Notify both teachers their daily schedule changed (today only).
-    final swapped = [
-      {'teacherId': d2?['teacherId'], 'data': d1},
-      {'teacherId': d1?['teacherId'], 'data': d2},
-    ];
-    for (final entry in swapped) {
-      final teacherId = entry['teacherId']?.toString() ?? '';
-      final data = entry['data'] as Map<String, dynamic>?;
-      if (teacherId.isEmpty || data == null) continue;
+    if (notifyTeacher1.isNotEmpty && notifyD1 != null) {
       await NotificationService().notifyTimetableChange(
-        teacherId: teacherId,
-        className: data['className']?.toString() ?? '',
-        day: data['day']?.toString() ?? '',
-        unit: (data['unit'] as num?)?.toInt() ?? 0,
+        teacherId: notifyTeacher1,
+        className: notifyD1!['className']?.toString() ?? '',
+        day: notifyD1!['day']?.toString() ?? '',
+        unit: (notifyD1!['unit'] as num?)?.toInt() ?? 0,
+        isPermanent: false,
+      );
+    }
+    if (notifyTeacher2.isNotEmpty && notifyD2 != null) {
+      await NotificationService().notifyTimetableChange(
+        teacherId: notifyTeacher2,
+        className: notifyD2!['className']?.toString() ?? '',
+        day: notifyD2!['day']?.toString() ?? '',
+        unit: (notifyD2!['unit'] as num?)?.toInt() ?? 0,
         isPermanent: false,
       );
     }
@@ -558,6 +818,13 @@ class TimetableService {
         .map((d) => TimetableSlotModel.fromMap(d.id, d.data()))
         .toList();
 
+    // Teachers who held a slot in this class BEFORE regeneration — needed
+    // afterwards to clean up any now-stale leave/exception data tied to a
+    // slot that no longer belongs to them (regeneration changing WHO
+    // teaches a slot must never leave behind a leave exception that still
+    // refers to the old, now-irrelevant teacher).
+    final previousTeacherIds = slots.map((s) => s.teacherId).toSet();
+
     final assignmentSlots = slots
         .map((s) => AssignmentSlot(
               day: s.day,
@@ -579,6 +846,17 @@ class TimetableService {
 
     final externalBusy = await _buildExternalBusy(excludeClassId: classId);
 
+    // Generation is intentionally neutral and randomized (see
+    // TimetableGenerator) — every run reshuffles tie-break order with a
+    // fresh Random() seed, and load is spread by penalizing repeats/streaks
+    // rather than ever hard-pinning "whoever's first in the list". Leave is
+    // deliberately NOT fed into the generator as a hard exclusion: the
+    // weekly pattern is a recurring template, leave is date-bound, so the
+    // correct behaviour is "generate the normal recurring pattern, then let
+    // the per-date exception layer vacate just the specific leave dates" —
+    // never the other way around. This is also why automation can never
+    // "override" a leave: it doesn't even touch the exception layer where
+    // leave lives.
     final result = TimetableGenerator.generate(
       slots: assignmentSlots,
       teacherQuotas: quotas,
@@ -609,10 +887,22 @@ class TimetableService {
       await batch.commit();
     }
 
+    // Resync exceptions for every teacher touched by this regeneration —
+    // both newly-assigned teachers (so any of THEIR active leave dates get
+    // (re)vacated for their new slots) and previously-assigned teachers
+    // who may have lost a slot (so stale leave exceptions tied to a slot
+    // they no longer teach get cleaned up instead of lingering as ghost
+    // data). See "what if a teacher requests leave after fixture
+    // assignment / what if generation runs after leave already exists".
+    final affectedTeacherIds = <String>{
+      ...result.slotIdToTeacherId.values,
+      ...previousTeacherIds,
+    }..removeWhere((id) => id.isEmpty);
+    await _afterWeeklyAssignmentChanged(affectedTeacherIds.toList());
+
     // Real notification: tell each affected teacher their timetable for
     // this class changed, instead of changing it silently behind the scenes.
-    final affectedTeacherIds = result.slotIdToTeacherId.values.toSet();
-    for (final teacherId in affectedTeacherIds) {
+    for (final teacherId in result.slotIdToTeacherId.values.toSet()) {
       if (teacherId.isEmpty) continue;
       await NotificationService().notifyTeacher(
         teacherId: teacherId,
@@ -650,135 +940,241 @@ class TimetableService {
   }
 
   // ---------------------------------------------------------------------------
-  // Leave-driven daily clearing (daily-only; weekly is never touched)
+  // Leave-driven exception sync (REPLACES the old "daily clearing")
   // ---------------------------------------------------------------------------
 
-  /// Called when a leave request is approved. For every day in the leave
-  /// range, materializes (if needed) and clears that teacher's DAILY slots
-  /// only — the permanent weekly pattern is never modified, since the
-  /// teacher is still expected back on a normal week once leave ends.
-  ///
-  /// Returns the list of vacated slot details (for fixture creation and
-  /// for telling the teacher exactly what was affected).
-  Future<List<Map<String, dynamic>>> clearScheduleForApprovedLeave({
-    required String teacherId,
-    required DateTime startDate,
-    required DateTime endDate,
+  /// Called any time a teacher's WEEKLY assignment(s) may have changed
+  /// (manual assign, exchange, regeneration, or right after a leave is
+  /// approved) — re-derives every leave exception that should exist for
+  /// [teacherIds] from scratch:
+  ///  - For every teacher with an active/future approved leave, ensures a
+  ///    'leave' exception exists for each (slot, date) where the CURRENT
+  ///    weekly pattern says they teach. This is what makes "if I'm on
+  ///    leave, my units empty out even on a class/slot that's brand new or
+  ///    was just edited" actually true — it's re-derived from the weekly
+  ///    pattern every time it changes, not written once and forgotten.
+  ///  - Removes any existing 'leave' exception that no longer corresponds
+  ///    to reality (the slot was reassigned away from the on-leave teacher,
+  ///    or the leave no longer covers that date) instead of leaving it
+  ///    behind as ghost data.
+  /// Never touches 'exchange' or 'admin_override' exceptions belonging to
+  /// other teachers — those are independent, one-off records.
+  Future<void> _afterWeeklyAssignmentChanged(List<String> teacherIds) async {
+    for (final teacherId in teacherIds.toSet()) {
+      if (teacherId.isEmpty) continue;
+      try {
+        await resyncTeacherLeaveExceptions(teacherId);
+      } catch (_) {
+        // Best-effort: a sync hiccup for one teacher must never block the
+        // assignment/generation that triggered it. An admin can always
+        // re-run "Resync leave" from the leave management screen.
+      }
+    }
+  }
+
+  /// Re-derives every 'leave' exception for [teacherId] against their
+  /// CURRENT approved leave window(s) and CURRENT weekly assignments.
+  /// Safe to call repeatedly (idempotent — deterministic doc IDs).
+  Future<List<Map<String, dynamic>>> resyncTeacherLeaveExceptions(
+    String teacherId, {
+    int horizonDays = 60,
   }) async {
+    if (teacherId.isEmpty) return const [];
     final vacated = <Map<String, dynamic>>[];
 
-    var cursor = DateTime(startDate.year, startDate.month, startDate.day);
-    final last = DateTime(endDate.year, endDate.month, endDate.day);
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final horizon = today.add(Duration(days: horizonDays));
 
-    while (!cursor.isAfter(last)) {
-      final dateKey =
-          '${cursor.year.toString().padLeft(4, '0')}-${cursor.month.toString().padLeft(2, '0')}-${cursor.day.toString().padLeft(2, '0')}';
+    final leavesSnap = await _firestore
+        .collection('leave_requests')
+        .where('teacherId', isEqualTo: teacherId)
+        .where('status', isEqualTo: 'approved')
+        .get();
 
-      // Make sure today's daily slots exist before we try to clear them.
-      // Safe to call repeatedly: it never overwrites existing daily-only
-      // overrides (see generateDailyForDate).
-      await generateDailyForDate(cursor);
-
-      final slotsSnap = await _daily
-          .where('date', isEqualTo: dateKey)
-          .where('teacherId', isEqualTo: teacherId)
-          .get();
-
-      if (slotsSnap.docs.isNotEmpty) {
-        final batch = _firestore.batch();
-        for (final doc in slotsSnap.docs) {
-          final data = doc.data();
-          batch.update(doc.reference, {
-            'teacherId': '',
-            'teacherName': '',
-            'type': 'on_leave',
-            'vacatedAt': FieldValue.serverTimestamp(),
-            'vacatedReason': 'approved_leave',
-          });
-
-          vacated.add({
-            'classId': data['classId'],
-            'className': data['className'],
-            'day': data['day'],
-            'unit': data['unit'],
-            'startTime': data['startTime'],
-            'endTime': data['endTime'],
-            'date': dateKey,
-            'absentTeacherId': teacherId,
-            'sourceDailySlotId': doc.id,
-          });
-        }
-        await batch.commit();
+    // Every date (within the horizon) this teacher is on approved leave.
+    final leaveDateKeys = <String>{};
+    for (final doc in leavesSnap.docs) {
+      final data = doc.data();
+      final start = (data['startDate'] as Timestamp?)?.toDate();
+      final end = (data['endDate'] as Timestamp?)?.toDate();
+      if (start == null || end == null) continue;
+      var cursor = DateTime(start.year, start.month, start.day);
+      final last = DateTime(end.year, end.month, end.day);
+      final clampedLast = last.isAfter(horizon) ? horizon : last;
+      while (!cursor.isAfter(clampedLast)) {
+        leaveDateKeys.add(dateKeyFor(cursor));
+        cursor = cursor.add(const Duration(days: 1));
       }
-
-      cursor = cursor.add(const Duration(days: 1));
     }
+
+    // This teacher's current weekly assignments.
+    final weeklySnap = await _weekly.where('teacherId', isEqualTo: teacherId).get();
+
+    // Existing leave exceptions ANYWHERE for this teacher (as the original
+    // owner of the slot) within the horizon — used to find stale ones to
+    // remove (slot reassigned away, or leave no longer covers that date).
+    final existingSnap = await _exceptions
+        .where('originalTeacherId', isEqualTo: teacherId)
+        .where('type', isEqualTo: 'leave')
+        .get();
+
+    final stillValidIds = <String>{};
+
+    for (final slotDoc in weeklySnap.docs) {
+      final slot = TimetableSlotModel.fromMap(slotDoc.id, slotDoc.data());
+      for (final dateKey in leaveDateKeys) {
+        // Only create/refresh for dates that actually fall on this slot's
+        // weekday within the horizon.
+        final parts = dateKey.split('-');
+        final d = DateTime(int.parse(parts[0]), int.parse(parts[1]), int.parse(parts[2]));
+        if (dayNameForDate(d) != slot.day) continue;
+
+        final id = exceptionId(slot.id, dateKey);
+        stillValidIds.add(id);
+
+        await _exceptions.doc(id).set({
+          'slotId': slot.id,
+          'classId': slot.classId,
+          'className': slot.className,
+          'day': slot.day,
+          'unit': slot.unit,
+          'startTime': slot.startTime,
+          'endTime': slot.endTime,
+          'date': dateKey,
+          'type': 'leave',
+          'teacherId': '',
+          'teacherName': '',
+          'originalTeacherId': teacherId,
+          'originalTeacherName': slot.teacherName,
+          'sourceId': '',
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+
+        vacated.add({
+          'classId': slot.classId,
+          'className': slot.className,
+          'day': slot.day,
+          'unit': slot.unit,
+          'startTime': slot.startTime,
+          'endTime': slot.endTime,
+          'date': dateKey,
+          'absentTeacherId': teacherId,
+          'sourceDailySlotId': slot.id,
+        });
+      }
+    }
+
+    // Remove stale leave exceptions: still flagged 'leave' for this teacher
+    // but no longer valid (slot reassigned, or date dropped off the leave).
+    final batch = _firestore.batch();
+    var deletions = 0;
+    for (final doc in existingSnap.docs) {
+      if (stillValidIds.contains(doc.id)) continue;
+      // Never delete one that's already been picked up by a fixture cover
+      // — that's a real, intentional state (someone is now covering this
+      // vacancy), not ghost data. Leave it as 'fixture_assigned' history;
+      // FixtureService manages its own lifecycle for those.
+      if (doc.data()['type'] != 'leave') continue;
+      batch.delete(doc.reference);
+      deletions++;
+      if (deletions >= 400) break; // stay under one batch's limit per pass
+    }
+    if (deletions > 0) await batch.commit();
 
     return vacated;
   }
 
   // ---------------------------------------------------------------------------
-  // Daily materialisation
+  // Effective (merged) schedule helpers
   // ---------------------------------------------------------------------------
 
-  // Daily-only override types: once a daily slot has one of these, a
-  // weekly-driven refresh must never touch it again. This is what makes
-  // "daily is independent of weekly" actually true instead of aspirational.
-  static const Set<String> _dailyOverrideTypes = {
-    'on_leave',
-    'fixture_assigned',
-    'override',
-  };
+  /// One-shot read of the merged weekly+exception schedule for [classId] on
+  /// [date]. Prefer the stream-based merge in the UI layer for live
+  /// updates; this is for one-off reads (e.g. building a printable view).
+  Future<List<EffectiveSlot>> getEffectiveSlotsForDate({
+    required String classId,
+    required DateTime date,
+  }) async {
+    final dateKey = dateKeyFor(date);
+    final weeklySnap = await _weekly.where('classId', isEqualTo: classId).get();
+    final excSnap = await _exceptions
+        .where('classId', isEqualTo: classId)
+        .where('date', isEqualTo: dateKey)
+        .get();
 
-  Future<int> generateDailyForDate(DateTime date, {String? classId}) async {
-    final dateKey =
-        '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
-    final day = dayNameForDate(date);
-
-    Query<Map<String, dynamic>> q = _weekly.where('day', isEqualTo: day);
-    if (classId != null) q = q.where('classId', isEqualTo: classId);
-    final snap = await q.get();
-
-    if (snap.docs.isEmpty) return 0;
-
-    // Find which daily slots already have a daily-only override so we can
-    // skip them entirely below — a weekly refresh must never clobber these.
-    Query<Map<String, dynamic>> existingQuery =
-        _daily.where('date', isEqualTo: dateKey);
-    if (classId != null) existingQuery = existingQuery.where('classId', isEqualTo: classId);
-    final existingSnap = await existingQuery.get();
-    final overriddenSlotIds = <String>{
-      for (final d in existingSnap.docs)
-        if (_dailyOverrideTypes.contains(d.data()['type']))
-          (d.data()['sourceSlotId'] as String? ?? '')
-    };
-
-    const batchLimit = 400;
-    final docs = snap.docs;
-    var written = 0;
-    for (var i = 0; i < docs.length; i += batchLimit) {
-      final batch = _firestore.batch();
-      for (final doc in docs.skip(i).take(batchLimit)) {
-        if (overriddenSlotIds.contains(doc.id)) continue; // protect the override
-
-        final data = doc.data();
-        final id = '${dateKey}_${doc.id}';
-        batch.set(_daily.doc(id), {
-          ...data,
-          'date': dateKey,
-          'sourceSlotId': doc.id,
-          'materializedAt': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
-        written++;
-      }
-      await batch.commit();
+    final excBySlotId = <String, TimetableExceptionModel>{};
+    for (final d in excSnap.docs) {
+      final e = TimetableExceptionModel.fromMap(d.id, d.data());
+      excBySlotId[e.slotId] = e;
     }
-    return written;
+
+    return weeklySnap.docs.map((d) {
+      final slot = TimetableSlotModel.fromMap(d.id, d.data());
+      return EffectiveSlot(weekly: slot, exception: excBySlotId[slot.id]);
+    }).toList();
   }
 
   // ---------------------------------------------------------------------------
-  // Class / profile creation
+  // Fixture-cover <-> exception bridge (used by FixtureService)
   // ---------------------------------------------------------------------------
+
+  /// Marks the exception for (slotId, date) as now covered by [teacherId]
+  /// (a fixture claim/assignment). Merges onto whatever exception already
+  /// exists for that slot+date (normally a 'leave' exception created by
+  /// [resyncTeacherLeaveExceptions]) so originalTeacherId/class/day/unit
+  /// metadata is preserved.
+  Future<void> markSlotCoveredForDate({
+    required String slotId,
+    required String date,
+    required String teacherId,
+    required String teacherName,
+    required String sourceFixtureId,
+  }) async {
+    await _exceptions.doc(exceptionId(slotId, date)).set({
+      'slotId': slotId,
+      'date': date,
+      'type': 'fixture_assigned',
+      'teacherId': teacherId,
+      'teacherName': teacherName,
+      'sourceId': sourceFixtureId,
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
+  /// Reverts the exception for (slotId, date) back to vacant — used when a
+  /// fixture covering that slot is released/expired. Stays type 'leave' so
+  /// the slot is correctly shown as "vacated, needs cover" rather than
+  /// disappearing back to looking like a normal staffed slot.
+  Future<void> revertSlotToVacantForDate({
+    required String slotId,
+    required String date,
+  }) async {
+    await _exceptions.doc(exceptionId(slotId, date)).set({
+      'slotId': slotId,
+      'date': date,
+      'type': 'leave',
+      'teacherId': '',
+      'teacherName': '',
+      'sourceId': '',
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
+  /// One-shot lookup of the exception (if any) for (slotId, date) — used by
+  /// FixtureService to check whether a slot is currently locked by an
+  /// approved-leave exception before allowing a same-day exchange/claim to
+  /// touch it.
+  Future<TimetableExceptionModel?> getExceptionForDate(
+    String slotId,
+    String date,
+  ) async {
+    final doc = await _exceptions.doc(exceptionId(slotId, date)).get();
+    if (!doc.exists) return null;
+    return TimetableExceptionModel.fromMap(doc.id, doc.data()!);
+  }
+
+
 
   Future<void> createTimeProfile({
     required String name,
@@ -930,19 +1326,73 @@ class TimetableService {
     }, SetOptions(merge: true));
   }
 
+  /// Deletes a class AND every piece of data that refers to it, in one
+  /// pass — weekly slots, every per-date exception, every fixture (cover
+  /// request) ever created against it, and the fixture_requests audit
+  /// trail rows for those fixtures. Without this, deleting a class used to
+  /// leave a trail of orphaned ("ghost") fixtures and exceptions that would
+  /// still show up in the marketplace, in teachers' "today" views, and in
+  /// admin reports, referencing a class that no longer exists — even when
+  /// an automation (e.g. a scheduled regeneration) ran afterwards.
   Future<void> deleteClass(String classId) async {
-    final slots = await _weekly.where('classId', isEqualTo: classId).get();
-
     const batchLimit = 400;
-    final docs = slots.docs;
-    for (var i = 0; i < docs.length; i += batchLimit) {
-      final batch = _firestore.batch();
-      for (final d in docs.skip(i).take(batchLimit)) {
-        batch.delete(d.reference);
+
+    Future<void> deleteAllDocs(QuerySnapshot<Map<String, dynamic>> snap) async {
+      final docs = snap.docs;
+      for (var i = 0; i < docs.length; i += batchLimit) {
+        final batch = _firestore.batch();
+        for (final d in docs.skip(i).take(batchLimit)) {
+          batch.delete(d.reference);
+        }
+        await batch.commit();
       }
-      await batch.commit();
     }
+
+    // 1) Weekly slots.
+    final slots = await _weekly.where('classId', isEqualTo: classId).get();
+    await deleteAllDocs(slots);
+
+    // 2) Every per-date exception for this class.
+    final exceptions = await _exceptions.where('classId', isEqualTo: classId).get();
+    await deleteAllDocs(exceptions);
+
+    // 3) Every fixture (open/claimed/assigned/expired cover) for this
+    // class, plus the fixture_requests audit rows that reference them.
+    try {
+      final fixturesSnap = await _firestore
+          .collection('fixtures')
+          .where('classId', isEqualTo: classId)
+          .get();
+      final fixtureIds = fixturesSnap.docs.map((d) => d.id).toSet();
+
+      if (fixtureIds.isNotEmpty) {
+        final requestsSnap =
+            await _firestore.collection('fixture_requests').get();
+        final orphanedRequests = requestsSnap.docs
+            .where((d) => fixtureIds.contains(d.data()['fixtureId']))
+            .toList();
+        for (var i = 0; i < orphanedRequests.length; i += batchLimit) {
+          final batch = _firestore.batch();
+          for (final d in orphanedRequests.skip(i).take(batchLimit)) {
+            batch.delete(d.reference);
+          }
+          await batch.commit();
+        }
+      }
+      await deleteAllDocs(fixturesSnap);
+    } catch (_) {
+      // Cascade of secondary (fixture) data must never block the actual
+      // class deletion the admin asked for.
+    }
+
+    // 4) The class document itself, last.
     await _classes.doc(classId).delete();
+
+    await _log('delete_class_cascade', {
+      'classId': classId,
+      'weeklySlotsDeleted': slots.docs.length,
+      'exceptionsDeleted': exceptions.docs.length,
+    });
   }
 
   bool _timeRangesOverlap(String aStart, String aEnd, String bStart, String bEnd) {

@@ -5,6 +5,15 @@ import 'package:flutter/material.dart';
 import '../../../core/services/admin_config_service.dart';
 import '../../../core/services/timetable_service.dart';
 
+/// One slot the signed-in teacher could offer up for today's exchange —
+/// either their own normal weekly slot (if not vacated by leave) or a
+/// fixture-cover slot they're standing in for someone else on today.
+class _ExchangeCandidate {
+  final String weeklySlotId;
+  final Map<String, dynamic> data;
+  const _ExchangeCandidate({required this.weeklySlotId, required this.data});
+}
+
 class ExchangeTimetableDialog extends StatefulWidget {
   const ExchangeTimetableDialog({super.key});
 
@@ -19,47 +28,97 @@ class _ExchangeTimetableDialogState
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
-  DocumentSnapshot<Map<String, dynamic>>? _slot1;
-  DocumentSnapshot<Map<String, dynamic>>? _slot2;
+  _ExchangeCandidate? _slot1;
+  _ExchangeCandidate? _slot2;
 
   bool _busy = false;
-  bool _ensuredDaily = false;
+
+  DateTime get _now => DateTime.now();
 
   String get _todayKey {
-    final now = DateTime.now();
+    final now = _now;
     return '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
   }
 
-  /// Same-day slot exchanges must operate on the Daily Timetable only — the
-  /// permanent Weekly template is never touched by a one-off swap. This
-  /// makes sure today's daily rows actually exist before the picker query
-  /// runs (no-ops harmlessly if they're already there).
-  Future<void> _ensureDailyExists() async {
-    if (_ensuredDaily) return;
-    _ensuredDaily = true;
-    try {
-      await _service.generateDailyForDate(DateTime.now());
-    } catch (_) {
-      // If this fails, the picker below will simply show "no slots found"
-      // rather than crash the dialog.
+  String get _todayDayName {
+    const days = [
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+      'Sunday',
+    ];
+    return days[_now.weekday - 1];
+  }
+
+  /// Today's exchangeable slots for the signed-in teacher: their own
+  /// weekly slots for today's weekday (skipping any vacated by approved
+  /// leave — those can never be exchanged away, only an admin override can
+  /// touch a leave-locked slot) plus any slot they're currently covering
+  /// for someone else via a claimed/assigned fixture today. Computed once
+  /// per dialog open (not a live stream) since this is a short-lived
+  /// picker, not a persistent screen.
+  Future<List<_ExchangeCandidate>> _loadTodayCandidates(String teacherUid) async {
+    final weeklySnap = await _firestore
+        .collection('weekly_timetables')
+        .where('teacherId', isEqualTo: teacherUid)
+        .where('day', isEqualTo: _todayDayName)
+        .get();
+
+    final excOwnSnap = await _firestore
+        .collection('timetable_exceptions')
+        .where('date', isEqualTo: _todayKey)
+        .where('originalTeacherId', isEqualTo: teacherUid)
+        .get();
+    final excCoverSnap = await _firestore
+        .collection('timetable_exceptions')
+        .where('date', isEqualTo: _todayKey)
+        .where('teacherId', isEqualTo: teacherUid)
+        .get();
+
+    final excBySlotId = <String, Map<String, dynamic>>{};
+    for (final d in excOwnSnap.docs) {
+      excBySlotId[d.data()['slotId']?.toString() ?? d.id] = d.data();
     }
+    for (final d in excCoverSnap.docs) {
+      excBySlotId[d.data()['slotId']?.toString() ?? d.id] = d.data();
+    }
+
+    final candidates = <_ExchangeCandidate>[];
+
+    for (final doc in weeklySnap.docs) {
+      final exc = excBySlotId.remove(doc.id);
+      if (exc != null && exc['type'] == 'leave') {
+        // This slot was vacated by approved leave today. If nobody has
+        // covered it yet there's nothing of theirs to exchange; if
+        // somebody else is now covering it, it's not this teacher's slot
+        // to offer either way.
+        continue;
+      }
+      candidates.add(_ExchangeCandidate(weeklySlotId: doc.id, data: doc.data()));
+    }
+
+    // Whatever's left in excBySlotId are slots NOT normally this
+    // teacher's, where they're now covering via a fixture today.
+    excBySlotId.forEach((slotId, exc) {
+      if ((exc['teacherId'] as String?) == teacherUid) {
+        candidates.add(_ExchangeCandidate(weeklySlotId: slotId, data: exc));
+      }
+    });
+
+    candidates.sort((a, b) =>
+        ((a.data['unit'] as num?)?.toInt() ?? 0)
+            .compareTo((b.data['unit'] as num?)?.toInt() ?? 0));
+    return candidates;
   }
 
   bool get _isExchangeSafe {
     if (_slot1 == null || _slot2 == null) return false;
 
-    // Exchange swaps teacherId between two slots.
-    // It is safe if the teacher's time window (same day) doesn't overlap
-    // when swapped: i.e., the other slot time doesn't conflict with the
-    // teacher's current assignment set.
-    //
-    // For this first implementation (destination-only), we ensure the two
-    // selected slots do NOT overlap in time with each other.
-    // This matches the "works without clash" expectation for a single-day
-    // exchange flow.
-    final data1 = _slot1!.data();
-    final data2 = _slot2!.data();
-    if (data1 == null || data2 == null) return false;
+    final data1 = _slot1!.data;
+    final data2 = _slot2!.data;
 
     final day1 = data1['day']?.toString() ?? '';
     final day2 = data2['day']?.toString() ?? '';
@@ -102,29 +161,14 @@ class _ExchangeTimetableDialogState
     return hour * 60 + minute;
   }
 
-
-  String _dayName(DateTime dt) {
-    // Mon=1..Sun=7
-    const days = [
-      'Monday',
-      'Tuesday',
-      'Wednesday',
-      'Thursday',
-      'Friday',
-      'Saturday',
-      'Sunday',
-    ];
-    return days[dt.weekday - 1];
-  }
-
   Future<void> _submitExchange() async {
     final user = _auth.currentUser;
     if (user == null) return;
     if (_slot1 == null || _slot2 == null) return;
     if (_busy) return;
 
-    final slotId1 = _slot1!.id;
-    final slotId2 = _slot2!.id;
+    final weeklySlotId1 = _slot1!.weeklySlotId;
+    final weeklySlotId2 = _slot2!.weeklySlotId;
 
     setState(() => _busy = true);
     try {
@@ -134,7 +178,11 @@ class _ExchangeTimetableDialogState
       if (await AdminConfigService().isPastUnifiedCutoffNow()) {
         throw Exception('Same-day slot exchanges are blocked after cutoff time');
       }
-      await _service.exchangeDailySlots(dailySlotId1: slotId1, dailySlotId2: slotId2);
+      await _service.exchangeForDate(
+        weeklySlotId1: weeklySlotId1,
+        weeklySlotId2: weeklySlotId2,
+        date: _now,
+      );
       if (!mounted) return;
       Navigator.pop(context, true);
     } catch (e) {
@@ -172,37 +220,21 @@ class _ExchangeTimetableDialogState
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-
             const Text('Pick 2 assigned slots (for today). This only changes today\'s schedule.'),
             const SizedBox(height: 12),
             Expanded(
-              child: FutureBuilder<void>(
-                future: _ensureDailyExists(),
-                builder: (context, ensureSnap) {
-                  if (ensureSnap.connectionState != ConnectionState.done) {
+              child: FutureBuilder<List<_ExchangeCandidate>>(
+                future: _loadTodayCandidates(user.uid),
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState != ConnectionState.done) {
                     return const Center(child: CircularProgressIndicator());
                   }
-                  return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                    // Single equality filter (`teacherId`) — filtering by
-                    // `date` too client-side avoids needing a manually
-                    // created composite index in every school's Firebase
-                    // project.
-                    stream: _firestore
-                        .collection('daily_timetables')
-                        .where('teacherId', isEqualTo: user.uid)
-                        .snapshots(),
-                    builder: (context, snapshot) {
-                  if (snapshot.connectionState == ConnectionState.waiting) {
-                    return const Center(child: CircularProgressIndicator());
+                  if (snapshot.hasError) {
+                    return Text('Could not load today\'s slots: ${snapshot.error}');
                   }
 
-                  final docs = [...(snapshot.data?.docs ?? [])]
-                    ..retainWhere((d) => d.data()['date']?.toString() == _todayKey)
-                    ..sort((a, b) =>
-                        ((a.data()['unit'] as num?)?.toInt() ?? 0)
-                            .compareTo((b.data()['unit'] as num?)?.toInt() ?? 0));
-
-                  if (docs.isEmpty) {
+                  final candidates = snapshot.data ?? const [];
+                  if (candidates.isEmpty) {
                     return const Text('No assigned slots found for today.');
                   }
 
@@ -211,15 +243,15 @@ class _ExchangeTimetableDialogState
                     scrollDirection: Axis.horizontal,
                     child: Row(
                       children: [
-                        ...docs.map((doc) {
-                          final data = doc.data();
+                        ...candidates.map((cand) {
+                          final data = cand.data;
                           final unit = data['unit']?.toString() ?? '';
                           final className = data['className']?.toString() ?? '';
                           final startTime = data['startTime']?.toString() ?? '';
                           final endTime = data['endTime']?.toString() ?? '';
 
-                          final isSelected1 = _slot1?.id == doc.id;
-                          final isSelected2 = _slot2?.id == doc.id;
+                          final isSelected1 = _slot1?.weeklySlotId == cand.weeklySlotId;
+                          final isSelected2 = _slot2?.weeklySlotId == cand.weeklySlotId;
 
                           return Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -246,11 +278,11 @@ class _ExchangeTimetableDialogState
                                         }
 
                                         if (_slot1 == null) {
-                                          _slot1 = doc;
+                                          _slot1 = cand;
                                         } else if (_slot2 == null) {
-                                          _slot2 = doc;
+                                          _slot2 = cand;
                                         } else {
-                                          _slot2 = doc;
+                                          _slot2 = cand;
                                         }
                                       });
                                     },
@@ -290,8 +322,6 @@ class _ExchangeTimetableDialogState
                       ],
                     ),
                   );
-                    },
-                  );
                 },
               ),
             ),
@@ -300,18 +330,16 @@ class _ExchangeTimetableDialogState
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(
-                  'Slot 1: ${_slot1 != null ? (_slot1!.data()?['unit'] ?? '') : '—'}',
+                  'Slot 1: ${_slot1 != null ? (_slot1!.data['unit'] ?? '') : '—'}',
                 ),
                 Text(
-                  'Slot 2: ${_slot2 != null ? (_slot2!.data()?['unit'] ?? '') : '—'}',
+                  'Slot 2: ${_slot2 != null ? (_slot2!.data['unit'] ?? '') : '—'}',
                 ),
               ],
             ),
           ],
         ),
       ),
-      
-
       actions: [
         TextButton(
           onPressed: () => Navigator.pop(context),
@@ -321,7 +349,6 @@ class _ExchangeTimetableDialogState
           onPressed: (_slot1 != null && _slot2 != null && !_busy && _isExchangeSafe)
               ? _submitExchange
               : null,
-
           child: _busy
               ? const SizedBox(
                   width: 18,
@@ -334,4 +361,3 @@ class _ExchangeTimetableDialogState
     );
   }
 }
-

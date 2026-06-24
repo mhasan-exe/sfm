@@ -200,6 +200,7 @@ class AdminConfigService {
     bool breakDutyRemindersEnabled = true,
     List<int> reminderOffsetsMinutes = const [30, 15],
     bool allowQuotaOverride = true,
+    bool protectFirstUnitForClassTeacher = true,
   }) async {
     await _configs.doc('system_settings').set({
       'allowFixtureMarketplace': allowFixtureMarketplace,
@@ -214,6 +215,7 @@ class AdminConfigService {
       'breakDutyRemindersEnabled': breakDutyRemindersEnabled,
       'reminderOffsetsMinutes': reminderOffsetsMinutes,
       'allowQuotaOverride': allowQuotaOverride,
+      'protectFirstUnitForClassTeacher': protectFirstUnitForClassTeacher,
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   }
@@ -284,6 +286,18 @@ class AdminConfigService {
     final settings = await getSystemSettings();
     return settings?['allowQuotaOverride'] as bool? ?? true;
   }
+
+  /// Whether unit 1 of every working day is locked to the class's
+  /// configured class teacher. Defaults to true (the school's normal
+  /// rule). Admins can still bypass this per-assignment with an explicit
+  /// "assign anyway" warning — this setting only controls whether the
+  /// *protection itself* is active, not whether it can ever be overridden
+  /// (a manual admin override is always possible, with a warning).
+  Future<bool> getProtectFirstUnitForClassTeacher() async {
+    final settings = await getSystemSettings();
+    return settings?['protectFirstUnitForClassTeacher'] as bool? ?? true;
+  }
+
 
   Future<List<int>> getReminderOffsetsMinutes() async {
     final settings = await getSystemSettings();

@@ -1,8 +1,12 @@
 /// A single cell in a class timetable: one [unit] on one [day] for one class.
 ///
-/// The canonical Firestore representation lives in `weekly_timetables` (the
-/// permanent weekly plan) and `daily_timetables` (per-date overrides). Both use
-/// the same field names. An empty [teacherId] means the slot is unassigned.
+/// `weekly_timetables` is now the ONLY permanent store for this shape of
+/// document — there is no more separate `daily_timetables` collection.
+/// Per-date deviations (leave, exchanges, admin one-off overrides, fixture
+/// cover) are sparse records in `timetable_exceptions`
+/// (see TimetableExceptionModel) layered on top of the weekly slot at read
+/// time, instead of a second full copy of every slot for every date. An
+/// empty [teacherId] means the slot is unassigned.
 class TimetableSlotModel {
   final String id;
   final String classId;

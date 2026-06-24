@@ -10,8 +10,10 @@ import '../../models/break_duty_model.dart';
 /// Teacher timetable (read-only).
 ///
 /// Data source strategy:
-/// - `weekly_timetables`: permanent weekly plan
-/// - `daily_timetables`: materialized daily overrides/absences
+/// - `weekly_timetables`: permanent weekly plan (single source of truth for
+///   "what normally happens")
+/// - `timetable_exceptions`: sparse per-date deviations (leave, exchanges,
+///   admin overrides, fixture cover) for "what's different today"
 ///
 /// UI:
 /// - Horizontal grid: days (columns) x units (rows)
@@ -146,10 +148,10 @@ class _TeacherTimetableGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final weeklyStream = _weeklyForTeacher(teacherId);
-    final dailyStream = _dailyForTeacherToday(teacherId, todayKey);
+    final exceptionsStream = _exceptionsForTeacherToday(teacherId, todayKey);
 
     return StreamBuilder<_MergedTeacherTimetable>(
-      stream: _mergeStreams(weeklyStream, dailyStream, todayKey),
+      stream: _mergeStreams(weeklyStream, exceptionsStream, todayKey),
       builder: (context, snapshot) {
         if (!snapshot.hasData) {
           return const SizedBox(
@@ -367,34 +369,71 @@ Stream<QuerySnapshot<Map<String, dynamic>>> _weeklyForTeacher(String teacherId) 
       .snapshots();
 }
 
-Stream<QuerySnapshot<Map<String, dynamic>>> _dailyForTeacherToday(
+/// Today's exceptions affecting this teacher — queried by BOTH
+/// `originalTeacherId` (their own slot, possibly vacated by leave) AND
+/// `teacherId` (a slot they're now covering for someone else). Querying
+/// only by the live `teacherId` field (the old `daily_timetables` query
+/// this replaces) was the actual bug: that field goes blank the instant a
+/// slot is vacated by approved leave, so a teacher's own "today" view
+/// would silently keep showing their normal weekly class instead of the
+/// vacancy — the data and the screen disagreeing with each other.
+Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>> _exceptionsForTeacherToday(
   String teacherId,
   String todayKey,
 ) {
-
-  return FirebaseFirestore.instance
-      .collection('daily_timetables')
-      .where('teacherId', isEqualTo: teacherId)
+  final ownStream = FirebaseFirestore.instance
+      .collection('timetable_exceptions')
       .where('date', isEqualTo: todayKey)
+      .where('originalTeacherId', isEqualTo: teacherId)
       .snapshots();
+  final coveringStream = FirebaseFirestore.instance
+      .collection('timetable_exceptions')
+      .where('date', isEqualTo: todayKey)
+      .where('teacherId', isEqualTo: teacherId)
+      .snapshots();
+
+  return Stream.multi((sink) {
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> own = [];
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> covering = [];
+
+    void emit() {
+      final byId = <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
+      for (final d in own) byId[d.id] = d;
+      for (final d in covering) byId[d.id] = d;
+      sink.add(byId.values.toList());
+    }
+
+    final s1 = ownStream.listen((snap) {
+      own = snap.docs;
+      emit();
+    }, onError: sink.addError);
+    final s2 = coveringStream.listen((snap) {
+      covering = snap.docs;
+      emit();
+    }, onError: sink.addError);
+
+    sink.onCancel = () async {
+      await s1.cancel();
+      await s2.cancel();
+    };
+  });
 }
 
-/// Merges weekly + today's daily overrides.
-/// Daily entries override weekly entries for the same (day, unit).
+/// Merges weekly + today's exceptions for this teacher.
+/// An exception overrides the weekly entry for the same (day, unit) when
+/// it exists. A vacated slot (exception teacherId blank) renders as empty
+/// instead of silently showing the normal weekly assignment.
 Stream<_MergedTeacherTimetable> _mergeStreams(
   Stream<QuerySnapshot<Map<String, dynamic>>> weekly,
-  Stream<QuerySnapshot<Map<String, dynamic>>> daily,
+  Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>> exceptions,
   String todayKey,
 ) {
-
-
-
   return Stream.multi((sink) {
     Map<String, Map<int, _TeacherSlotCell>> mergedByDay = {};
     int maxUnit = 0;
 
     Map<String, Map<int, _TeacherSlotCell>> weeklyMap = {};
-    Map<String, Map<int, _TeacherSlotCell>> dailyMap = {};
+    Map<String, Map<int, _TeacherSlotCell>> exceptionMap = {};
 
     void computeAndEmit() {
       mergedByDay = {};
@@ -412,8 +451,9 @@ Stream<_MergedTeacherTimetable> _mergeStreams(
 
       // Weekly first...
       apply(weeklyMap);
-      // ...then daily overwrites.
-      apply(dailyMap);
+      // ...then today's exceptions overwrite (including showing as empty
+      // when an exception vacates a slot).
+      apply(exceptionMap);
 
       sink.add(
         _MergedTeacherTimetable(
@@ -431,9 +471,9 @@ Stream<_MergedTeacherTimetable> _mergeStreams(
       onError: sink.addError,
     );
 
-    final dailySub = daily.listen(
-      (snap) {
-        dailyMap = _extractMap(snap, dateKey: todayKey);
+    final exceptionSub = exceptions.listen(
+      (docs) {
+        exceptionMap = _extractExceptionMap(docs, dateKey: todayKey);
         computeAndEmit();
       },
       onError: sink.addError,
@@ -441,9 +481,42 @@ Stream<_MergedTeacherTimetable> _mergeStreams(
 
     sink.onCancel = () async {
       await weeklySub.cancel();
-      await dailySub.cancel();
+      await exceptionSub.cancel();
     };
   });
+}
+
+Map<String, Map<int, _TeacherSlotCell>> _extractExceptionMap(
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> docs, {
+  required String dateKey,
+}) {
+  final byDay = <String, Map<int, _TeacherSlotCell>>{};
+
+  for (final doc in docs) {
+    final data = doc.data();
+    final day = (data['day'] as String?) ?? '';
+    final unit = (data['unit'] as num?)?.toInt() ?? 0;
+    if (day.isEmpty || unit <= 0) continue;
+
+    // Blank teacherId here means genuinely vacant (leave with nobody
+    // covering yet) — exactly what should render, not a fallback to the
+    // weekly value.
+    final teacherName = (data['teacherName'] as String?) ?? '';
+    final className = (data['className'] as String?) ?? '';
+    final startTime = (data['startTime'] as String?) ?? '';
+    final endTime = (data['endTime'] as String?) ?? '';
+
+    byDay.putIfAbsent(day, () => {});
+    byDay[day]![unit] = _TeacherSlotCell(
+      teacherName: teacherName,
+      className: className,
+      startTime: startTime,
+      endTime: endTime,
+      dateKey: dateKey,
+    );
+  }
+
+  return byDay;
 }
 
 Map<String, Map<int, _TeacherSlotCell>> _extractMap(

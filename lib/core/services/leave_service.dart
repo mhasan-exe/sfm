@@ -164,58 +164,104 @@ class LeaveService {
     return false;
   }
 
-  // Approve a leave request
+  // ---------------------------------------------------------------------
+  // Approve a leave request.
+  //
+  // FIX (concurrency / "what if two admins approve at the same time?"):
+  // the status flip from 'pending' -> 'approved' now happens inside a
+  // Firestore transaction that re-reads the document and aborts if it's
+  // no longer 'pending'. Two admins tapping "Approve" within the same
+  // instant can therefore never both succeed — the loser gets a clean
+  // "already handled" exception instead of silently re-running the
+  // (expensive, side-effectful) slot-vacating + fixture-creation flow
+  // twice, which used to risk duplicate fixtures.
+  //
+  // FIX (ghost duplicate writes / "what if internet disconnects during
+  // approval?"): every exception/fixture doc this creates now has a
+  // deterministic id (slotId+date), so retrying this entire call after a
+  // dropped connection is always safe — nothing is ever duplicated.
+  //
+  // FIX (multiple sources of truth): this used to ALSO directly write into
+  // `daily_timetables` with a second, separate, completely redundant pass
+  // over every class right after already clearing the same teacher's
+  // schedule via TimetableService — the exact "multiple sources of truth"
+  // bug. There is now exactly one call that does this:
+  // TimetableService.resyncTeacherLeaveExceptions.
+  // ---------------------------------------------------------------------
   Future<void> approveLeave({
     required String leaveRequestId,
     required String adminId,
     String? adminComment,
   }) async {
     final leaveRef = _leaveRequests.doc(leaveRequestId);
-    final leaveDoc = await leaveRef.get();
 
-    if (!leaveDoc.exists) {
-      throw Exception('Leave request not found');
-    }
+    late String teacherId;
+    late DateTime startDate;
+    late DateTime endDate;
 
-    final data = leaveDoc.data()!;
-    final teacherId = (data['teacherId'] as String?) ?? '';
-    if (teacherId.isEmpty) {
-      throw Exception('Leave request missing teacherId');
-    }
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final leaveDoc = await tx.get(leaveRef);
+      if (!leaveDoc.exists) {
+        throw Exception('Leave request not found');
+      }
+      final data = leaveDoc.data()!;
+      final status = (data['status'] as String?) ?? 'pending';
+      if (status != 'pending') {
+        throw Exception(
+            'This leave request was already $status by someone else.');
+      }
 
-    final startDate = (data['startDate'] as Timestamp).toDate();
-    final endDate = (data['endDate'] as Timestamp).toDate();
-    if (endDate.isBefore(startDate)) {
-      throw Exception('Invalid leave date range');
-    }
+      teacherId = (data['teacherId'] as String?) ?? '';
+      if (teacherId.isEmpty) {
+        throw Exception('Leave request missing teacherId');
+      }
+      startDate = (data['startDate'] as Timestamp).toDate();
+      endDate = (data['endDate'] as Timestamp).toDate();
+      if (endDate.isBefore(startDate)) {
+        throw Exception('Invalid leave date range');
+      }
 
-    // 1) Mark approved first (source of truth).
-    await leaveRef.update({
-      'status': 'approved',
-      'approvedAt': FieldValue.serverTimestamp(),
-      'approvedBy': adminId,
-      'adminComment': adminComment,
+      tx.update(leaveRef, {
+        'status': 'approved',
+        'approvedAt': FieldValue.serverTimestamp(),
+        'approvedBy': adminId,
+        'adminComment': adminComment,
+      });
     });
 
-    // 2) Clear the teacher's DAILY schedule for every day in the leave
-    // range (never the permanent weekly pattern — they're still expected
-    // back on a normal week once leave ends), and open each vacated slot
-    // as a fixture other teachers can cover.
+    // From here on the approval itself is committed and final — everything
+    // below is "apply the consequences of an approval that already
+    // happened", and is safe to retry/best-effort because every write it
+    // makes is idempotent (deterministic doc ids).
     List<Map<String, dynamic>> vacatedSlots = [];
     try {
-      vacatedSlots = await TimetableService().clearScheduleForApprovedLeave(
+      vacatedSlots = await TimetableService().resyncTeacherLeaveExceptions(teacherId);
+    } catch (_) {
+      // Don't let a sync hiccup block the approval itself — the leave is
+      // approved either way; an admin can re-run the sync from the leave
+      // management screen if a slot doesn't show as vacated yet.
+    }
+
+    try {
+      if (vacatedSlots.isNotEmpty) {
+        await FixtureService().createFixturesForSlots(uncoveredSlots: vacatedSlots);
+      }
+    } catch (_) {}
+
+    // "What if someone exchanges a fixture and then gets leave approved?":
+    // if this teacher had ALREADY claimed/been-assigned someone else's
+    // fixture (agreed to cover a different absence) for a date that now
+    // falls inside their own newly-approved leave, they can no longer show
+    // up for that cover either — release it back to the marketplace
+    // instead of silently leaving a fixture "covered" by someone who is
+    // now also absent.
+    try {
+      await FixtureService().releaseFixturesForTeacherDuringLeave(
         teacherId: teacherId,
         startDate: startDate,
         endDate: endDate,
       );
-      if (vacatedSlots.isNotEmpty) {
-        await FixtureService().createFixturesForSlots(uncoveredSlots: vacatedSlots);
-      }
-    } catch (_) {
-      // Don't let a clearing/fixture-creation hiccup block the approval
-      // itself — the leave is approved either way; an admin can manually
-      // patch up any uncovered slot from the timetable editor if needed.
-    }
+    } catch (_) {}
 
     // Real notification: tell the teacher their leave was approved, and
     // exactly which classes/units were freed up so they can see at a
@@ -233,99 +279,38 @@ class LeaveService {
       type: NotificationType.leaveApproved,
       data: {'leaveRequestId': leaveRequestId},
     );
-
-    // 2) Apply leave effect to `daily_timetables` on all dates in the
-    // approved range.
-    //
-    // TeacherTimetableScreen renders from:
-    // - weekly_timetables (permanent)
-    // - daily_timetables filtered by `date == yyyy-MM-dd`
-    // and treats empty teacherName/teacherId as an empty slot.
-
-    // Find all classes that include this teacher in their configured
-    // `teachers` list.
-    final classesSnap = await FirebaseFirestore.instance
-        .collection('classes')
-        .get();
-
-    final classIds = <String>{};
-    for (final cdoc in classesSnap.docs) {
-      final data = cdoc.data();
-      final rawTeachers = data['teachers'];
-      if (rawTeachers is! List) continue;
-
-      final matches = rawTeachers.whereType<Map>().any((t) {
-        final tid = t['teacherId']?.toString() ?? '';
-        return tid == teacherId;
-      });
-
-      if (matches) classIds.add(cdoc.id);
-    }
-
-    if (classIds.isNotEmpty) {
-      DateTime cursor = DateTime(startDate.year, startDate.month, startDate.day);
-      final last = DateTime(endDate.year, endDate.month, endDate.day);
-
-      while (!cursor.isAfter(last)) {
-        final dateKey =
-            '${cursor.year.toString().padLeft(4, '0')}-'
-            '${cursor.month.toString().padLeft(2, '0')}-'
-            '${cursor.day.toString().padLeft(2, '0')}';
-
-        // For each class, clear teacher assignments for this date.
-        for (final classId in classIds) {
-          final snap = await FirebaseFirestore.instance
-              .collection('daily_timetables')
-              .where('classId', isEqualTo: classId)
-              .where('teacherId', isEqualTo: teacherId)
-              .where('date', isEqualTo: dateKey)
-              .get();
-
-          if (snap.docs.isEmpty) continue;
-
-          final batch = FirebaseFirestore.instance.batch();
-          for (final doc in snap.docs) {
-            batch.set(
-              doc.reference,
-              {
-                'teacherId': '',
-                'teacherName': '',
-                'type': 'leave',
-                'leaveAppliedAt': FieldValue.serverTimestamp(),
-                // keep teacher slot identifiers (day/unit/classId/start/end)
-              },
-              SetOptions(merge: true),
-            );
-          }
-          await batch.commit();
-        }
-
-        cursor = cursor.add(const Duration(days: 1));
-      }
-    }
-
   }
 
-  // Reject a leave request
+  // Reject a leave request — also transactional with a status guard, so
+  // two admins racing an approve vs. a reject on the same request can
+  // never both win.
   Future<void> rejectLeave({
     required String leaveRequestId,
     required String adminId,
     required String reason,
   }) async {
-    final leaveDoc = await _leaveRequests.doc(leaveRequestId).get();
+    final leaveRef = _leaveRequests.doc(leaveRequestId);
+    String teacherId = '';
 
-    if (!leaveDoc.exists) {
-      throw Exception('Leave request not found');
-    }
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final leaveDoc = await tx.get(leaveRef);
+      if (!leaveDoc.exists) {
+        throw Exception('Leave request not found');
+      }
+      final data = leaveDoc.data()!;
+      final status = (data['status'] as String?) ?? 'pending';
+      if (status != 'pending') {
+        throw Exception(
+            'This leave request was already $status by someone else.');
+      }
+      teacherId = (data['teacherId'] as String?) ?? '';
 
-    final data = leaveDoc.data()!;
-    final teacherId = (data['teacherId'] as String?) ?? '';
-
-    await _leaveRequests.doc(leaveRequestId).update({
-      'status': 'rejected',
-      'rejectedAt': FieldValue.serverTimestamp(),
-      'approvedBy': adminId,
-      'rejectionReason': reason,
+      tx.update(leaveRef, {
+        'status': 'rejected',
+        'rejectedAt': FieldValue.serverTimestamp(),
+        'approvedBy': adminId,
+        'rejectionReason': reason,
+      });
     });
 
     if (teacherId.isNotEmpty) {
@@ -462,24 +447,26 @@ class LeaveService {
     };
   }
 
-  // Cancel a pending leave request
+  // Cancel a pending leave request — also transactional, so a request
+  // can't be cancelled in the same instant it's being approved/rejected by
+  // an admin (whichever transaction commits first wins; the other sees a
+  // status that's no longer 'pending' and fails cleanly).
   Future<void> cancelLeave({required String leaveRequestId}) async {
-    final leaveDoc = await _leaveRequests.doc(leaveRequestId).get();
+    final leaveRef = _leaveRequests.doc(leaveRequestId);
 
-    if (!leaveDoc.exists) {
-      throw Exception('Leave request not found');
-    }
-
-    final leave = leaveDoc.data()!;
-
-    if (leave['status'] != 'pending') {
-      throw Exception('Only pending leaves can be cancelled');
-    }
-
-    await _leaveRequests.doc(leaveRequestId).update({
-      'status': 'cancelled',
-      'cancelledAt': FieldValue.serverTimestamp(),
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final leaveDoc = await tx.get(leaveRef);
+      if (!leaveDoc.exists) {
+        throw Exception('Leave request not found');
+      }
+      final leave = leaveDoc.data()!;
+      if (leave['status'] != 'pending') {
+        throw Exception('Only pending leaves can be cancelled');
+      }
+      tx.update(leaveRef, {
+        'status': 'cancelled',
+        'cancelledAt': FieldValue.serverTimestamp(),
+      });
     });
   }
 }
-

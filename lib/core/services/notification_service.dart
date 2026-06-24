@@ -371,16 +371,25 @@ class NotificationService {
 
       // Single equality filter (`teacherId`) + client-side day/date
       // filtering — matches the safe pattern already used elsewhere in
-      // this app (see teacher_timetable_screen.dart's _weeklyForTeacher).
-      // A two-field where() chain here would need a manually-created
-      // composite index in every school's Firebase project; this never
-      // does.
+      // this app. A two-field where() chain here would need a
+      // manually-created composite index in every school's Firebase
+      // project; this never does.
       final weeklySnap = await _firestore
           .collection('weekly_timetables')
           .where('teacherId', isEqualTo: teacherId)
           .get();
-      final dailySnap = await _firestore
-          .collection('daily_timetables')
+
+      // Exceptions are queried by BOTH originalTeacherId (so a slot that
+      // just got vacated by this teacher's own leave correctly suppresses
+      // the reminder instead of still firing for a class they're not
+      // attending) and teacherId (so a slot this teacher is now covering
+      // via a fixture/exchange correctly gets a reminder too).
+      final exceptionsOwnSnap = await _firestore
+          .collection('timetable_exceptions')
+          .where('originalTeacherId', isEqualTo: teacherId)
+          .get();
+      final exceptionsCoveringSnap = await _firestore
+          .collection('timetable_exceptions')
           .where('teacherId', isEqualTo: teacherId)
           .get();
 
@@ -391,7 +400,22 @@ class NotificationService {
         final unit = (data['unit'] as num?)?.toInt() ?? 0;
         if (unit > 0) byUnit[unit] = data;
       }
-      for (final d in dailySnap.docs) {
+      // Own slots that were vacated by leave/exchange today — remove the
+      // reminder entirely (teacherId blank means "not actually teaching").
+      for (final d in exceptionsOwnSnap.docs) {
+        final data = d.data();
+        if (data['date']?.toString() != dateKey) continue;
+        final unit = (data['unit'] as num?)?.toInt() ?? 0;
+        if (unit <= 0) continue;
+        final effectiveTeacher = data['teacherId']?.toString() ?? '';
+        if (effectiveTeacher == teacherId) {
+          byUnit[unit] = data; // still them (e.g. admin override kept them)
+        } else {
+          byUnit.remove(unit); // vacated or handed to someone else
+        }
+      }
+      // Slots this teacher is now covering for someone else.
+      for (final d in exceptionsCoveringSnap.docs) {
         final data = d.data();
         if (data['date']?.toString() != dateKey) continue;
         final unit = (data['unit'] as num?)?.toInt() ?? 0;

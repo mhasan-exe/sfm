@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../models/fixture_model.dart';
 import 'admin_config_service.dart';
 import 'notification_service.dart';
+import 'timetable_service.dart';
 
 class FixtureService {
   CollectionReference<Map<String, dynamic>> get _fixtures =>
@@ -12,6 +13,21 @@ class FixtureService {
       FirebaseFirestore.instance.collection('fixture_requests');
 
   final AdminConfigService _adminConfig = AdminConfigService();
+  final TimetableService _timetable = TimetableService();
+
+  /// Deterministic fixture doc id for a (weekly slot, date) pair. This is
+  /// what makes [createFixturesForSlots] idempotent: if leave approval
+  /// retries (flaky connection, the same leave somehow getting resynced
+  /// twice), the SAME fixture document is overwritten in place instead of a
+  /// second "ghost" fixture being created for the same vacancy. Legacy
+  /// pattern-only fixtures (no explicit date — not produced by the current
+  /// leave flow, kept only for backward compatibility) fall back to an
+  /// auto-generated id since they have no natural per-occurrence key.
+  String? _deterministicFixtureId(String? sourceSlotId, String? date) {
+    if (sourceSlotId == null || sourceSlotId.isEmpty) return null;
+    if (date == null || date.isEmpty) return null;
+    return '${sourceSlotId}_$date';
+  }
 
   // Create fixtures for uncovered slots (no assigned teacher)
   //
@@ -24,12 +40,15 @@ class FixtureService {
     final claimWindowHours = await _adminConfig.getFixtureClaimWindowHours();
     final batch = FirebaseFirestore.instance.batch();
     for (final slot in uncoveredSlots) {
-      final fixtureDoc = _fixtures.doc();
+      final explicitDate = slot['date'] as String?;
+      final sourceSlotId = slot['sourceDailySlotId'] as String?;
+      final deterministicId = _deterministicFixtureId(sourceSlotId, explicitDate);
+      final fixtureDoc =
+          deterministicId != null ? _fixtures.doc(deterministicId) : _fixtures.doc();
 
       // Calculate expiry time: configurable window before the unit starts
       // (defaults to 1 hour; admins can tighten/loosen this in Settings).
       final startTime = slot['startTime'] as String?;
-      final explicitDate = slot['date'] as String?;
       final expiresAt = (explicitDate != null && explicitDate.isNotEmpty)
           ? _calculateExpireTimeForDate(startTime, explicitDate, claimWindowHours)
           : _calculateExpireTime(startTime, slot['day'], claimWindowHours);
@@ -51,18 +70,82 @@ class FixtureService {
         'status': 'available',
         'date': explicitDate ?? '',
         'absentTeacherId': slot['absentTeacherId'],
-        'sourceDailySlotId': slot['sourceDailySlotId'],
-      });
+        // Kept under its historical field name for backward compatibility
+        // with already-deployed data; this is now always the WEEKLY slot
+        // id (weekly_timetables doc id), never a daily_timetables id —
+        // that collection no longer exists.
+        'sourceDailySlotId': sourceSlotId,
+      }, SetOptions(merge: true));
     }
 
     await batch.commit();
   }
 
+  /// Called right after a teacher's OWN leave is approved: if they had
+  /// themselves claimed or been admin-assigned someone else's fixture
+  /// (covering a different absent teacher) on a date that now falls inside
+  /// their own leave window, they obviously can't show up for that either.
+  /// Releases each such fixture back to 'available' (clamped, never
+  /// negative, decrement of their fixtureUnits) and reverts the underlying
+  /// slot's exception back to vacant so it visibly needs cover again —
+  /// instead of silently leaving a class "covered by" someone who is now
+  /// also absent. Covers: "what if someone exchanges/claims a fixture and
+  /// then gets their OWN leave approved?"
+  Future<void> releaseFixturesForTeacherDuringLeave({
+    required String teacherId,
+    required DateTime startDate,
+    required DateTime endDate,
+  }) async {
+    final claimedSnap = await _fixtures.where('claimedBy', isEqualTo: teacherId).get();
+    final assignedSnap =
+        await _fixtures.where('assignedTeacherId', isEqualTo: teacherId).get();
+
+    final start = DateTime(startDate.year, startDate.month, startDate.day);
+    final end = DateTime(endDate.year, endDate.month, endDate.day);
+
+    final toRelease = <QueryDocumentSnapshot<Map<String, dynamic>>>{
+      ...claimedSnap.docs,
+      ...assignedSnap.docs,
+    }.where((d) {
+      final date = d.data()['date'] as String?;
+      if (date == null || date.isEmpty) return false;
+      final parts = date.split('-');
+      if (parts.length != 3) return false;
+      final fixtureDate = DateTime(
+        int.parse(parts[0]),
+        int.parse(parts[1]),
+        int.parse(parts[2]),
+      );
+      final status = d.data()['status'] as String?;
+      if (status == 'expired' || status == 'available') return false;
+      return !fixtureDate.isBefore(start) && !fixtureDate.isAfter(end);
+    }).toList();
+
+    for (final doc in toRelease) {
+      try {
+        await _releaseFixtureInternal(
+          fixtureId: doc.id,
+          teacherId: teacherId,
+          reasonNote: 'auto-released: covering teacher went on approved leave',
+        );
+        await NotificationService().notifyAdmins(
+          title: 'Cover needs reassignment',
+          body:
+              '${doc.data()['className'] ?? 'A class'} (unit ${doc.data()['unit']}, ${doc.data()['date']}) lost its cover — the covering teacher just went on approved leave too.',
+          action: 'fixture_cover_lost_to_leave',
+          data: {'fixtureId': doc.id},
+        );
+      } catch (_) {
+        // Best-effort per fixture; one failure must not block the rest.
+      }
+    }
+  }
+
   // Teachers can claim available fixtures
   /// True only when [teacherId] is completely free at [fixture]'s day/time —
-  /// no weekly class, no daily override, no other claimed fixture, and not
-  /// on approved leave. The marketplace UI uses this to disable/hide the
-  /// "Claim" button up front instead of only finding out via a thrown
+  /// no weekly class, no exception-covered slot, no other claimed fixture,
+  /// and not on approved leave. The marketplace UI uses this to disable/hide
+  /// the "Claim" button up front instead of only finding out via a thrown
   /// exception after tapping it.
   Future<bool> isTeacherFreeForFixture(FixtureModel fixture, String teacherId) async {
     if (fixture.date.isNotEmpty) {
@@ -71,9 +154,9 @@ class FixtureService {
     }
 
     // Single equality filter + client-side filtering throughout this
-    // method on purpose: weekly_timetables/daily_timetables/fixtures are
-    // all small-ish per-teacher collections, and this guarantees no new
-    // composite index is ever required in a freshly deployed school's
+    // method on purpose: weekly_timetables/timetable_exceptions/fixtures
+    // are all small-ish per-teacher collections, and this guarantees no
+    // new composite index is ever required in a freshly deployed school's
     // Firebase project.
     final weeklyBusySnap = await FirebaseFirestore.instance
         .collection('weekly_timetables')
@@ -88,13 +171,13 @@ class FixtureService {
     }
 
     if (fixture.date.isNotEmpty) {
-      final dailyBusySnap = await FirebaseFirestore.instance
-          .collection('daily_timetables')
+      final exceptionBusySnap = await FirebaseFirestore.instance
+          .collection('timetable_exceptions')
           .where('date', isEqualTo: fixture.date)
+          .where('teacherId', isEqualTo: teacherId)
           .get();
-      for (final d in dailyBusySnap.docs) {
+      for (final d in exceptionBusySnap.docs) {
         final data = d.data();
-        if (data['teacherId']?.toString() != teacherId) continue;
         if (_overlaps(fixture.startTime, fixture.endTime, data['startTime']?.toString() ?? '', data['endTime']?.toString() ?? '')) {
           return false;
         }
@@ -116,32 +199,48 @@ class FixtureService {
     return true;
   }
 
+  /// Clamped, never-negative decrement: reads the user doc inside the
+  /// transaction and floors the result at 0, instead of a bare
+  /// `FieldValue.increment(-1)` that could drive `fixtureUnits` negative if
+  /// a release/expiry/exchange races with another write touching the same
+  /// counter (e.g. the periodic expiry sweep releasing a claim at the same
+  /// moment the teacher releases it themselves). Addresses "what if weekly
+  /// units become negative?".
+  Future<void> _safeAdjustFixtureUnits(
+    Transaction tx,
+    String teacherId,
+    int delta,
+  ) async {
+    if (teacherId.isEmpty) return;
+    final ref = FirebaseFirestore.instance.collection('users').doc(teacherId);
+    final snap = await tx.get(ref);
+    final current = (snap.data()?['fixtureUnits'] as num?)?.toInt() ?? 0;
+    final next = current + delta;
+    tx.update(ref, {'fixtureUnits': next < 0 ? 0 : next});
+  }
+
   Future<void> claimFixture({
     required String fixtureId,
     required String teacherId,
     required String teacherName,
   }) async {
-    final fixtureDoc = await _fixtures.doc(fixtureId).get();
+    final fixtureRef = _fixtures.doc(fixtureId);
 
-    if (!fixtureDoc.exists) {
+    // Pre-flight checks that need data the transaction doesn't strictly
+    // need to re-verify (unified cutoff, leave, "is this teacher free"
+    // cross-collection scan) are done before the transaction; the
+    // transaction itself re-checks `status == 'available'` and the claim
+    // window right before committing, which is what actually closes the
+    // "two teachers tap Claim on the same fixture at the same instant"
+    // race — only the first transaction to commit wins; the second sees
+    // status already flipped and throws instead of silently double-claiming.
+    final preCheckDoc = await fixtureRef.get();
+    if (!preCheckDoc.exists) {
       throw Exception('Fixture not found');
     }
+    final preCheck = preCheckDoc.data()!;
 
-    final fixture = fixtureDoc.data()!;
-
-    if (fixture['status'] != 'available') {
-      throw Exception('Fixture is no longer available');
-    }
-
-    final expiresAt = (fixture['expiresAt'] as Timestamp).toDate();
-    if (DateTime.now().isAfter(expiresAt)) {
-      throw Exception('Fixture claim window has expired');
-    }
-
-    // Unified cutoff: same-day fixture claims are blocked after the
-    // school's single configured cutoff time, exactly like leave requests
-    // and exchanges.
-    final fixtureDate = fixture['date'] as String?;
+    final fixtureDate = preCheck['date'] as String?;
     if (fixtureDate != null && fixtureDate.isNotEmpty) {
       final now = DateTime.now();
       final todayKey =
@@ -149,85 +248,77 @@ class FixtureService {
       if (fixtureDate == todayKey && await _adminConfig.isPastUnifiedCutoffNow()) {
         throw Exception('Same-day fixture claims are blocked after cutoff time');
       }
-    }
-
-    // A teacher on approved leave that day can't claim a fixture for it —
-    // they're not supposed to be working at all.
-    if (fixtureDate != null && fixtureDate.isNotEmpty) {
       final onLeave = await _isTeacherOnApprovedLeave(teacherId, fixtureDate);
       if (onLeave) {
         throw Exception('You are on approved leave on this date.');
       }
     }
 
-    // Only FREE teachers can claim cover — block if this teacher already
-    // has a class (or another fixture) at the exact same day/time. Reuses
-    // the same check the marketplace UI uses to grey out the button, so
-    // there's exactly one definition of "busy" instead of two that could
-    // drift apart.
     final isFree = await isTeacherFreeForFixture(
-      FixtureModel.fromMap(fixtureId, fixture),
+      FixtureModel.fromMap(fixtureId, preCheck),
       teacherId,
     );
     if (!isFree) {
       throw Exception('You already have a class (or another fixture) at this time — only free teachers can claim cover.');
     }
 
-    // Check if teacher can take this fixture (unit limits) — actively
-    // blocked, not just warned, so a teacher can never be pushed past the
-    // school's configured quota by claiming.
-    final userDoc = await FirebaseFirestore.instance
-        .collection('users')
-        .doc(teacherId)
-        .get();
-
+    final userDoc = await FirebaseFirestore.instance.collection('users').doc(teacherId).get();
     if (!userDoc.exists) {
       throw Exception('Teacher not found');
     }
-
     final user = userDoc.data()!;
     final defaultUnits = user['defaultUnits'] as int? ?? 0;
     final fixtureUnits = user['fixtureUnits'] as int? ?? 0;
-    final total = defaultUnits + fixtureUnits;
     final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
-
-    if (total >= maxUnits) {
+    if (defaultUnits + fixtureUnits >= maxUnits) {
       throw Exception('You have reached your $maxUnits-unit weekly limit and cannot claim more cover.');
     }
 
-    // Claim the fixture
-    await _fixtures.doc(fixtureId).update({
-      'claimedBy': teacherId,
-      'claimedByName': teacherName,
-      'status': 'claimed',
-      'claimedAt': FieldValue.serverTimestamp(),
+    Map<String, dynamic>? committedFixture;
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final fixtureDoc = await tx.get(fixtureRef);
+      if (!fixtureDoc.exists) {
+        throw Exception('Fixture not found');
+      }
+      final fixture = fixtureDoc.data()!;
+      if (fixture['status'] != 'available') {
+        throw Exception('Fixture is no longer available — someone else just claimed it.');
+      }
+      final expiresAt = (fixture['expiresAt'] as Timestamp).toDate();
+      if (DateTime.now().isAfter(expiresAt)) {
+        throw Exception('Fixture claim window has expired');
+      }
+
+      tx.update(fixtureRef, {
+        'claimedBy': teacherId,
+        'claimedByName': teacherName,
+        'status': 'claimed',
+        'claimedAt': FieldValue.serverTimestamp(),
+      });
+
+      await _safeAdjustFixtureUnits(tx, teacherId, 1);
+      committedFixture = fixture;
     });
 
-    // Update teacher's fixture units
-    await FirebaseFirestore.instance
-        .collection('users')
-        .doc(teacherId)
-        .update({
-      'fixtureUnits': FieldValue.increment(1),
-    });
+    if (committedFixture == null) return;
+    final fixture = committedFixture!;
 
-    // Daily is the sole source of truth for the live schedule — writing the
-    // claim into `fixtures` alone would leave the actual daily_timetables
-    // slot looking permanently vacant even after someone picks it up.
-    final sourceDailySlotId = fixture['sourceDailySlotId'] as String?;
-    if (sourceDailySlotId != null && sourceDailySlotId.isNotEmpty) {
-      await FirebaseFirestore.instance
-          .collection('daily_timetables')
-          .doc(sourceDailySlotId)
-          .set({
-        'teacherId': teacherId,
-        'teacherName': teacherName,
-        'type': 'fixture_assigned',
-        'coveredAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+    // The exception layer is the sole source of truth for the live
+    // schedule — writing the claim into `fixtures` alone would leave the
+    // underlying slot looking permanently vacant even after someone picks
+    // it up.
+    final sourceSlotId = fixture['sourceDailySlotId'] as String?;
+    final date = fixture['date'] as String? ?? '';
+    if (sourceSlotId != null && sourceSlotId.isNotEmpty && date.isNotEmpty) {
+      await _timetable.markSlotCoveredForDate(
+        slotId: sourceSlotId,
+        date: date,
+        teacherId: teacherId,
+        teacherName: teacherName,
+        sourceFixtureId: fixtureId,
+      );
     }
 
-    // Create a fixture request record
     await _fixtureRequests.add({
       'fixtureId': fixtureId,
       'teacherId': teacherId,
@@ -255,55 +346,57 @@ class FixtureService {
     );
   }
 
-  // Teacher can release a claimed fixture
-  Future<void> releaseFixture({
+  /// Shared release implementation used by both the teacher-initiated
+  /// [releaseFixture] and the leave-triggered auto-release in
+  /// [releaseFixturesForTeacherDuringLeave].
+  Future<void> _releaseFixtureInternal({
     required String fixtureId,
     required String teacherId,
+    String? reasonNote,
   }) async {
-    final fixtureDoc = await _fixtures.doc(fixtureId).get();
+    final fixtureRef = _fixtures.doc(fixtureId);
+    Map<String, dynamic>? released;
 
-    if (!fixtureDoc.exists) {
-      throw Exception('Fixture not found');
-    }
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final fixtureDoc = await tx.get(fixtureRef);
+      if (!fixtureDoc.exists) {
+        throw Exception('Fixture not found');
+      }
+      final fixture = fixtureDoc.data()!;
+      final currentHolder = (fixture['claimedBy'] as String?) ??
+          (fixture['assignedTeacherId'] as String?) ??
+          '';
+      if (currentHolder != teacherId) {
+        throw Exception('Only the current covering teacher can release this fixture');
+      }
+      if (fixture['status'] == 'available') {
+        // Already released (e.g. by a concurrent call) — nothing to do.
+        return;
+      }
 
-    final fixture = fixtureDoc.data()!;
-
-    if (fixture['claimedBy'] != teacherId) {
-      throw Exception('Only the claiming teacher can release this fixture');
-    }
-
-    // Release the fixture
-    await _fixtures.doc(fixtureId).update({
-      'claimedBy': null,
-      'claimedByName': null,
-      'status': 'available',
-      'releasedAt': FieldValue.serverTimestamp(),
-    });
-
-    // Reduce teacher's fixture units
-    await FirebaseFirestore.instance
-        .collection('users')
-        .doc(teacherId)
-        .update({
-      'fixtureUnits': FieldValue.increment(-1),
-    });
-
-    // Revert the daily slot back to vacant so the live schedule stays
-    // accurate — it's open for someone else to cover again.
-    final sourceDailySlotId = fixture['sourceDailySlotId'] as String?;
-    if (sourceDailySlotId != null && sourceDailySlotId.isNotEmpty) {
-      await FirebaseFirestore.instance
-          .collection('daily_timetables')
-          .doc(sourceDailySlotId)
-          .set({
-        'teacherId': '',
-        'teacherName': '',
-        'type': 'on_leave',
+      tx.update(fixtureRef, {
+        'claimedBy': null,
+        'claimedByName': null,
+        'assignedTeacherId': null,
+        'assignedTeacherName': null,
+        'status': 'available',
         'releasedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+        if (reasonNote != null) 'releaseNote': reasonNote,
+      });
+
+      await _safeAdjustFixtureUnits(tx, teacherId, -1);
+      released = fixture;
+    });
+
+    if (released == null) return;
+    final fixture = released!;
+
+    final sourceSlotId = fixture['sourceDailySlotId'] as String?;
+    final date = fixture['date'] as String? ?? '';
+    if (sourceSlotId != null && sourceSlotId.isNotEmpty && date.isNotEmpty) {
+      await _timetable.revertSlotToVacantForDate(slotId: sourceSlotId, date: date);
     }
 
-    // Update fixture request record
     await _fixtureRequests
         .where('fixtureId', isEqualTo: fixtureId)
         .where('teacherId', isEqualTo: teacherId)
@@ -320,83 +413,82 @@ class FixtureService {
     });
   }
 
+  // Teacher can release a claimed fixture
+  Future<void> releaseFixture({
+    required String fixtureId,
+    required String teacherId,
+  }) =>
+      _releaseFixtureInternal(fixtureId: fixtureId, teacherId: teacherId);
+
   // Admin can assign fixtures 1 hour before or when expired
   Future<void> assignFixture({
     required String fixtureId,
     required String teacherId,
     required String teacherName,
   }) async {
-    final fixtureDoc = await _fixtures.doc(fixtureId).get();
+    final fixtureRef = _fixtures.doc(fixtureId);
 
-    if (!fixtureDoc.exists) {
-      throw Exception('Fixture not found');
-    }
-
-    final fixture = fixtureDoc.data()!;
-    final expiresAt = (fixture['expiresAt'] as Timestamp).toDate();
-
-    // Can only assign after expiry or 1 hour before
-    if (DateTime.now().isBefore(expiresAt)) {
-      throw Exception('Can only assign fixtures 1 hour before they start');
-    }
-
-    // If already claimed by someone else, release them first
-    if (fixture['claimedBy'] != null && fixture['claimedBy'] != teacherId) {
-      final claimedBy = fixture['claimedBy'];
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(claimedBy)
-          .update({
-        'fixtureUnits': FieldValue.increment(-1),
-      });
-    }
-
-    // Check unit limits for new teacher
-    final userDoc = await FirebaseFirestore.instance
-        .collection('users')
-        .doc(teacherId)
-        .get();
-
+    final userDoc = await FirebaseFirestore.instance.collection('users').doc(teacherId).get();
     if (!userDoc.exists) {
       throw Exception('Teacher not found');
     }
-
     final user = userDoc.data()!;
     final defaultUnits = user['defaultUnits'] as int? ?? 0;
-    final fixtureUnits = user['fixtureUnits'] as int? ?? 0;
     final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
 
-    // Don't count current teacher if they already claimed it
-    int currentTeacherFixtures = fixtureUnits;
-    if (fixture['claimedBy'] != teacherId) {
-      currentTeacherFixtures = fixtureUnits + 1;
-    }
+    String? previousHolder;
+    Map<String, dynamic>? committedFixture;
 
-    if (defaultUnits + currentTeacherFixtures > maxUnits) {
-      throw Exception(
-        'Assigning this fixture would exceed the teacher\'s $maxUnits-unit limit',
-      );
-    }
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final fixtureDoc = await tx.get(fixtureRef);
+      if (!fixtureDoc.exists) {
+        throw Exception('Fixture not found');
+      }
+      final fixture = fixtureDoc.data()!;
+      final expiresAt = (fixture['expiresAt'] as Timestamp).toDate();
+      if (DateTime.now().isBefore(expiresAt)) {
+        throw Exception('Can only assign fixtures 1 hour before they start');
+      }
 
-    // Assign the fixture
-    await _fixtures.doc(fixtureId).update({
-      'assignedTeacherId': teacherId,
-      'assignedTeacherName': teacherName,
-      'status': 'assigned',
-      'assignedAt': FieldValue.serverTimestamp(),
+      final currentClaimedBy = fixture['claimedBy'] as String?;
+      if (currentClaimedBy != null && currentClaimedBy != teacherId) {
+        previousHolder = currentClaimedBy;
+      }
+
+      // Re-read the assignee's live fixtureUnits inside the transaction so
+      // two concurrent admin assignments can't both pass a stale quota
+      // check.
+      final assigneeRef = FirebaseFirestore.instance.collection('users').doc(teacherId);
+      final assigneeSnap = await tx.get(assigneeRef);
+      final liveFixtureUnits = (assigneeSnap.data()?['fixtureUnits'] as num?)?.toInt() ?? 0;
+      final alreadyCountsForThisFixture = currentClaimedBy == teacherId;
+      final projectedFixtureUnits =
+          alreadyCountsForThisFixture ? liveFixtureUnits : liveFixtureUnits + 1;
+
+      if (defaultUnits + projectedFixtureUnits > maxUnits) {
+        throw Exception('Assigning this fixture would exceed the teacher\'s $maxUnits-unit limit');
+      }
+
+      if (previousHolder != null) {
+        await _safeAdjustFixtureUnits(tx, previousHolder!, -1);
+      }
+      if (!alreadyCountsForThisFixture) {
+        await _safeAdjustFixtureUnits(tx, teacherId, 1);
+      }
+
+      tx.update(fixtureRef, {
+        'assignedTeacherId': teacherId,
+        'assignedTeacherName': teacherName,
+        'status': 'assigned',
+        'assignedAt': FieldValue.serverTimestamp(),
+      });
+
+      committedFixture = fixture;
     });
 
-    // If not already counted in fixtures, increment
-    if (fixture['claimedBy'] != teacherId) {
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(teacherId)
-          .update({
-        'fixtureUnits': FieldValue.increment(1),
-      });
-    }
+    if (committedFixture == null) return;
+    final fixture = committedFixture!;
 
-    // Update fixture request record
     await _fixtureRequests.add({
       'fixtureId': fixtureId,
       'teacherId': teacherId,
@@ -406,18 +498,16 @@ class FixtureService {
       'createdAt': FieldValue.serverTimestamp(),
     });
 
-    // Daily is the sole source of truth for the live schedule.
-    final sourceDailySlotId = fixture['sourceDailySlotId'] as String?;
-    if (sourceDailySlotId != null && sourceDailySlotId.isNotEmpty) {
-      await FirebaseFirestore.instance
-          .collection('daily_timetables')
-          .doc(sourceDailySlotId)
-          .set({
-        'teacherId': teacherId,
-        'teacherName': teacherName,
-        'type': 'fixture_assigned',
-        'coveredAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+    final sourceSlotId = fixture['sourceDailySlotId'] as String?;
+    final date = fixture['date'] as String? ?? '';
+    if (sourceSlotId != null && sourceSlotId.isNotEmpty && date.isNotEmpty) {
+      await _timetable.markSlotCoveredForDate(
+        slotId: sourceSlotId,
+        date: date,
+        teacherId: teacherId,
+        teacherName: teacherName,
+        sourceFixtureId: fixtureId,
+      );
     }
 
     final className = fixture['className'] as String? ?? 'a class';
@@ -464,8 +554,11 @@ class FixtureService {
         'expiredAt': FieldValue.serverTimestamp(),
       });
 
-      // If someone had claimed it, release them.
-      // IMPORTANT: don't await inside the loop (can exceed UI/framework timeouts).
+      // If someone had claimed it, release their unit count (clamped via a
+      // read-then-write would be ideal, but this sweep already runs in a
+      // single batch across many docs — falling back to increment here is
+      // acceptable since expiry is a one-way transition guarded by
+      // `isExpired == false`, so the same doc can't be expired twice).
       final claimedBy = doc.data()['claimedBy'];
       if (claimedBy != null) {
         batch.update(
@@ -895,22 +988,13 @@ class FixtureService {
     required String toTeacherId,
     required String toTeacherName,
   }) async {
-    final fixtureDoc = await _fixtures.doc(fixtureId).get();
+    final fixtureRef = _fixtures.doc(fixtureId);
 
-    if (!fixtureDoc.exists) {
-      throw Exception('Fixture not found');
-    }
+    final preCheckDoc = await fixtureRef.get();
+    if (!preCheckDoc.exists) throw Exception('Fixture not found');
+    final preCheck = preCheckDoc.data()!;
 
-    final fixture = fixtureDoc.data()!;
-
-    if (fixture['claimedBy'] != fromTeacherId &&
-        fixture['assignedTeacherId'] != fromTeacherId) {
-      throw Exception('Only the current teacher can exchange this fixture');
-    }
-
-    // Unified cutoff applies to fixture exchanges too, exactly like leave
-    // and fixture claims.
-    final fixtureDate = fixture['date'] as String?;
+    final fixtureDate = preCheck['date'] as String?;
     if (fixtureDate != null && fixtureDate.isNotEmpty) {
       final now = DateTime.now();
       final todayKey =
@@ -918,53 +1002,72 @@ class FixtureService {
       if (fixtureDate == todayKey && await _adminConfig.isPastUnifiedCutoffNow()) {
         throw Exception('Same-day fixture exchanges are blocked after cutoff time');
       }
+      // The recipient must not themselves be on approved leave that date —
+      // otherwise the exchange would just create a brand-new uncovered gap.
+      final recipientOnLeave = await _isTeacherOnApprovedLeave(toTeacherId, fixtureDate);
+      if (recipientOnLeave) {
+        throw Exception('${toTeacherName.isEmpty ? "That teacher" : toTeacherName} is on approved leave on this date.');
+      }
     }
 
-    // Check unit limits for recipient
-    final recipientDoc = await FirebaseFirestore.instance
-        .collection('users')
-        .doc(toTeacherId)
-        .get();
-
+    final recipientDoc = await FirebaseFirestore.instance.collection('users').doc(toTeacherId).get();
     if (!recipientDoc.exists) {
       throw Exception('Recipient teacher not found');
     }
-
     final recipient = recipientDoc.data()!;
     final defaultUnits = recipient['defaultUnits'] as int? ?? 0;
-    final fixtureUnits = recipient['fixtureUnits'] as int? ?? 0;
     final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
 
-    if (defaultUnits + fixtureUnits >= maxUnits) {
-      throw Exception('Recipient has reached their $maxUnits-unit limit');
+    Map<String, dynamic>? committedFixture;
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      final fixtureDoc = await tx.get(fixtureRef);
+      if (!fixtureDoc.exists) throw Exception('Fixture not found');
+      final fixture = fixtureDoc.data()!;
+
+      final currentHolder = (fixture['claimedBy'] as String?) ??
+          (fixture['assignedTeacherId'] as String?) ??
+          '';
+      if (currentHolder != fromTeacherId) {
+        throw Exception('Only the current teacher can exchange this fixture');
+      }
+
+      final recipientRef = FirebaseFirestore.instance.collection('users').doc(toTeacherId);
+      final recipientSnap = await tx.get(recipientRef);
+      final liveFixtureUnits = (recipientSnap.data()?['fixtureUnits'] as num?)?.toInt() ?? 0;
+      if (defaultUnits + liveFixtureUnits >= maxUnits) {
+        throw Exception('Recipient has reached their $maxUnits-unit limit');
+      }
+
+      tx.update(fixtureRef, {
+        'claimedBy': toTeacherId,
+        'claimedByName': toTeacherName,
+        'assignedTeacherId': null,
+        'assignedTeacherName': null,
+        'status': 'claimed',
+        'exchangedAt': FieldValue.serverTimestamp(),
+      });
+
+      await _safeAdjustFixtureUnits(tx, fromTeacherId, -1);
+      await _safeAdjustFixtureUnits(tx, toTeacherId, 1);
+
+      committedFixture = fixture;
+    });
+
+    if (committedFixture == null) return;
+    final fixture = committedFixture!;
+
+    final sourceSlotId = fixture['sourceDailySlotId'] as String?;
+    final date = fixture['date'] as String? ?? '';
+    if (sourceSlotId != null && sourceSlotId.isNotEmpty && date.isNotEmpty) {
+      await _timetable.markSlotCoveredForDate(
+        slotId: sourceSlotId,
+        date: date,
+        teacherId: toTeacherId,
+        teacherName: toTeacherName,
+        sourceFixtureId: fixtureId,
+      );
     }
 
-    // Perform exchange
-    await _fixtures.doc(fixtureId).update({
-      'claimedBy': toTeacherId,
-      'claimedByName': toTeacherName,
-      'assignedTeacherId': null,
-      'assignedTeacherName': null,
-      'status': 'claimed',
-      'exchangedAt': FieldValue.serverTimestamp(),
-    });
-
-    // Update both teachers' units
-    await FirebaseFirestore.instance
-        .collection('users')
-        .doc(fromTeacherId)
-        .update({
-      'fixtureUnits': FieldValue.increment(-1),
-    });
-
-    await FirebaseFirestore.instance
-        .collection('users')
-        .doc(toTeacherId)
-        .update({
-      'fixtureUnits': FieldValue.increment(1),
-    });
-
-    // Log exchange
     await _fixtureRequests.add({
       'fixtureId': fixtureId,
       'fromTeacherId': fromTeacherId,
