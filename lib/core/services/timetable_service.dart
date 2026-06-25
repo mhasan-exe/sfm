@@ -264,6 +264,15 @@ class TimetableService {
       'type': 'permanent',
       'assignedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
+
+    // The slot's permanent occupant just changed — if it had an open
+    // vacancy/fixture tied to whoever taught it before, that's now stale.
+    try {
+      await _reconcileStaleCoverForSlot(slotId);
+    } catch (_) {
+      // Best-effort: never let a reconciliation hiccup roll back an
+      // assignment that already committed.
+    }
   }
 
   Future<void> assignTeacherToWeeklySlot({
@@ -282,6 +291,10 @@ class TimetableService {
       'type': 'permanent',
       'clearedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
+
+    try {
+      await _reconcileStaleCoverForSlot(slotId);
+    } catch (_) {}
   }
 
   // ---------------------------------------------------------------------------
@@ -646,16 +659,27 @@ class TimetableService {
       tx.update(ref1, {
         'teacherId': d2['teacherId'] ?? '',
         'teacherName': d2['teacherName'] ?? '',
+        'originalTeacherId': d2['teacherId'] ?? '',
         'type': 'override',
         'exchangedAt': FieldValue.serverTimestamp(),
       });
       tx.update(ref2, {
         'teacherId': d1['teacherId'] ?? '',
         'teacherName': d1['teacherName'] ?? '',
+        'originalTeacherId': d1['teacherId'] ?? '',
         'type': 'override',
         'exchangedAt': FieldValue.serverTimestamp(),
       });
     });
+
+    // Both slots changed owner — cancel any now-stale open fixture/cover
+    // tied to whoever taught them before this swap.
+    try {
+      await _reconcileStaleCoverForSlot(slotId1);
+    } catch (_) {}
+    try {
+      await _reconcileStaleCoverForSlot(slotId2);
+    } catch (_) {}
 
     // Both teachers' day/unit ownership just changed permanently — make
     // sure any leave-driven exceptions tied to their OLD slots are
@@ -887,6 +911,21 @@ class TimetableService {
       await batch.commit();
     }
 
+    // Cancel any now-stale open fixture/cover for every slot whose owner
+    // actually changed during this regeneration (comparing against the
+    // pre-generation snapshot in `slots`) — otherwise a vacancy that the
+    // regenerator just resolved with a brand-new permanent teacher would
+    // keep showing as an open cover request in the marketplace.
+    final oldTeacherBySlotId = {for (final s in slots) s.id: s.teacherId};
+    for (final id in ids) {
+      final oldTeacherId = oldTeacherBySlotId[id] ?? '';
+      final newTeacherId = result.slotIdToTeacherId[id] ?? '';
+      if (oldTeacherId == newTeacherId) continue;
+      try {
+        await _reconcileStaleCoverForSlot(id);
+      } catch (_) {}
+    }
+
     // Resync exceptions for every teacher touched by this regeneration —
     // both newly-assigned teachers (so any of THEIR active leave dates get
     // (re)vacated for their new slots) and previously-assigned teachers
@@ -1086,6 +1125,117 @@ class TimetableService {
   }
 
   // ---------------------------------------------------------------------------
+  // Stale-cover reconciliation
+  //
+  // THE BUG: assigning a teacher directly onto a slot used to only ever
+  // touch `weekly_timetables`. If that slot already had an open/claimed
+  // fixture (because its previous occupant was on leave), that fixture and
+  // its `fixture_assigned`/`leave` exception were left completely alone —
+  // so the marketplace kept showing an open cover request for a vacancy
+  // that a direct manual assignment had just resolved. resyncTeacherLeave-
+  // Exceptions deliberately never touches `fixture_assigned` exceptions
+  // (so a real, in-progress cover never gets wiped from under it) — which
+  // is correct for that one purpose, but means NOTHING else was cleaning
+  // these up either once the underlying slot changed hands.
+  //
+  // THE FIX: any time a slot's `teacherId` is changed directly (manual
+  // assign, exchange, regeneration, preset restore), reconcile every
+  // exception that still exists for that slotId: if it was about a
+  // teacher who no longer owns the slot, the vacancy it represents is
+  // gone — cancel the underlying fixture (if any) and delete the exception.
+  // ---------------------------------------------------------------------------
+
+  /// Cancels the fixture (if one exists) covering [slotId] on [date].
+  /// Talks to the `fixtures` collection directly with the same
+  /// deterministic id scheme FixtureService uses (`${slotId}_$date`)
+  /// rather than importing FixtureService — FixtureService already
+  /// depends on TimetableService (for the exception-merge helpers above),
+  /// and importing it back here would create a circular dependency.
+  Future<void> _cancelStaleFixtureForSlotDate(String slotId, String date) async {
+    final fixtureRef = _firestore.collection('fixtures').doc('${slotId}_$date');
+    try {
+      await _firestore.runTransaction((tx) async {
+        final snap = await tx.get(fixtureRef);
+        if (!snap.exists) return;
+        final data = snap.data()!;
+        final status = (data['status'] as String?) ?? '';
+        if (status == 'cancelled' || status == 'expired') return;
+
+        // If someone had already claimed/been-assigned this cover, give
+        // their fixtureUnits credit back (floored at 0) — they no longer
+        // need to teach it, the direct reassignment superseded them.
+        final coveringTeacherId = (data['claimedBy'] as String?)?.isNotEmpty == true
+            ? data['claimedBy'] as String
+            : (data['assignedTeacherId'] as String?) ?? '';
+        if (coveringTeacherId.isNotEmpty) {
+          final userRef = _firestore.collection('users').doc(coveringTeacherId);
+          final userSnap = await tx.get(userRef);
+          if (userSnap.exists) {
+            final current = (userSnap.data()?['fixtureUnits'] as num?)?.toInt() ?? 0;
+            if (current > 0) {
+              tx.update(userRef, {'fixtureUnits': current - 1});
+            }
+          }
+        }
+
+        tx.update(fixtureRef, {
+          'status': 'cancelled',
+          'claimedBy': '',
+          'claimedByName': '',
+          'assignedTeacherId': '',
+          'assignedTeacherName': '',
+          'cancelledReason': 'Slot reassigned directly from the timetable editor',
+          'cancelledAt': FieldValue.serverTimestamp(),
+        });
+      });
+    } catch (_) {
+      // Best-effort — must never block the assignment that triggered this.
+      // Worst case an admin sees a now-redundant fixture in the
+      // marketplace for a day and can cancel it by hand from there.
+    }
+  }
+
+  /// Re-evaluates every exception tied to [slotId] against the slot's
+  /// CURRENT `teacherId`. Any exception whose `originalTeacherId` no
+  /// longer matches the current occupant is stale — that occupant doesn't
+  /// teach this slot any more, so whatever vacancy/cover state existed for
+  /// them here is meaningless now. Cancels the underlying fixture (if the
+  /// exception had progressed to `fixture_assigned`) and deletes the
+  /// exception either way.
+  Future<void> _reconcileStaleCoverForSlot(String slotId) async {
+    final slotSnap = await _weekly.doc(slotId).get();
+    if (!slotSnap.exists) return;
+    final currentTeacherId = (slotSnap.data()?['teacherId'] as String?) ?? '';
+
+    final excSnap = await _exceptions.where('slotId', isEqualTo: slotId).get();
+    if (excSnap.docs.isEmpty) return;
+
+    final batch = _firestore.batch();
+    var deletions = 0;
+    for (final doc in excSnap.docs) {
+      final data = doc.data();
+      final originalTeacherId = (data['originalTeacherId'] as String?) ?? '';
+      final type = (data['type'] as String?) ?? '';
+      final date = (data['date'] as String?) ?? '';
+
+      // Still about whoever currently occupies this slot — not stale.
+      if (originalTeacherId == currentTeacherId) continue;
+      // An 'exchange' exception is about THIS slot's effective teacher for
+      // one specific day, independent of who permanently owns it — leave
+      // those alone; they're not a leave/cover vacancy at all.
+      if (type == 'exchange') continue;
+
+      if (type == 'fixture_assigned' && date.isNotEmpty) {
+        await _cancelStaleFixtureForSlotDate(slotId, date);
+      }
+      batch.delete(doc.reference);
+      deletions++;
+      if (deletions >= 400) break;
+    }
+    if (deletions > 0) await batch.commit();
+  }
+
+  // ---------------------------------------------------------------------------
   // Effective (merged) schedule helpers
   // ---------------------------------------------------------------------------
 
@@ -1175,126 +1325,71 @@ class TimetableService {
   }
 
   // ---------------------------------------------------------------------------
-  // Presets — named snapshots of a class's weekly assignment, restorable
-  // later. Lets an admin safely try a regeneration or a big manual reshuffle
-  // and get back to a known-good schedule with one tap instead of having to
-  // remember/redo every assignment by hand.
+  // Hooks for TimetablePresetService (lib/core/services/timetable_preset_service.dart)
+  //
+  // Presets are NOT implemented here — there's exactly one preset system in
+  // this app, the whole-school one in TimetablePresetService (subcollection-
+  // based, so a large school's snapshot can't hit Firestore's 1MB document
+  // limit the way a single array field eventually would). What TimetableService
+  // needs to provide is a way for that service to ask "I just overwrote a
+  // pile of weekly_timetables docs directly — please reconcile whatever
+  // that broke" once it's done, instead of leaving stale leave exceptions
+  // and stale open fixtures behind after every restore.
   // ---------------------------------------------------------------------------
 
-  CollectionReference<Map<String, dynamic>> get _presets =>
-      _firestore.collection('timetable_presets');
-
-  /// Snapshots every weekly slot's current teacher for [classId] under
-  /// [name]. Unassigned slots are saved too (as empty), so restoring a
-  /// preset is a true "go back to exactly this" rather than a partial merge.
-  Future<String> saveWeeklyPreset({
-    required String classId,
-    required String name,
-    String? createdBy,
+  /// Call after any BULK external rewrite of `weekly_timetables` (i.e. a
+  /// preset restore) that didn't go through [assignTeacher]/[exchangeSlots]/
+  /// regeneration. [touchedSlotIds] should be every still-existing slot id
+  /// whose teacherId may have changed; [touchedTeacherIds] every teacherId
+  /// that lost or gained a slot; [deletedSlotIds] any slot id that no
+  /// longer exists at all post-restore (a preset can shrink the schedule).
+  /// Cleans up stale leave/fixture-cover exceptions tied to the slots that
+  /// changed owner or vanished, and re-derives leave vacancies for every
+  /// teacher touched — the same reconciliation a single manual assignment
+  /// gets, just batched for many slots at once.
+  Future<void> reconcileAfterBulkWeeklyRewrite({
+    required List<String> touchedSlotIds,
+    required List<String> touchedTeacherIds,
+    List<String> deletedSlotIds = const [],
   }) async {
-    final snap = await _weekly.where('classId', isEqualTo: classId).get();
-    final slots = snap.docs.map((d) {
-      final data = d.data();
-      return {
-        'day': data['day'] ?? '',
-        'unit': data['unit'] ?? 0,
-        'teacherId': data['teacherId'] ?? '',
-        'teacherName': data['teacherName'] ?? '',
-      };
-    }).toList();
-
-    final ref = await _presets.add({
-      'classId': classId,
-      'name': name,
-      'slotCount': slots.length,
-      'slots': slots,
-      'createdAt': FieldValue.serverTimestamp(),
-      'createdBy': createdBy ?? '',
-    });
-
-    await _log('save_timetable_preset', {
-      'classId': classId,
-      'presetId': ref.id,
-      'name': name,
-      'slotCount': slots.length,
-    });
-
-    return ref.id;
-  }
-
-  /// Every saved preset for [classId], newest first.
-  Stream<List<Map<String, dynamic>>> watchPresets(String classId) {
-    return _presets.where('classId', isEqualTo: classId).snapshots().map((snap) {
-      final list = snap.docs.map((d) => {...d.data(), 'id': d.id}).toList();
-      list.sort((a, b) {
-        final ta = a['createdAt'];
-        final tb = b['createdAt'];
-        final da = ta is Timestamp ? ta.toDate() : DateTime.fromMillisecondsSinceEpoch(0);
-        final db = tb is Timestamp ? tb.toDate() : DateTime.fromMillisecondsSinceEpoch(0);
-        return db.compareTo(da);
-      });
-      return list;
-    });
-  }
-
-  Future<void> deletePreset(String presetId) async {
-    await _presets.doc(presetId).delete();
-  }
-
-  /// Overwrites the current weekly assignment for the preset's class with
-  /// whatever was saved in it, then resyncs leave exceptions for every
-  /// teacher touched — both newly-restored ones (so their active leave
-  /// vacates the right slots again) and whoever currently held those slots
-  /// before the restore (so a stale leave exception tied to a teacher who
-  /// no longer teaches that slot doesn't linger as ghost data). This is
-  /// the exact same "diff old vs new assignment, resync both sides" pattern
-  /// used by regeneration and exchanges, applied here too on purpose — a
-  /// restore is just another way a weekly assignment can change.
-  Future<void> restorePreset(String presetId) async {
-    final doc = await _presets.doc(presetId).get();
-    if (!doc.exists) throw Exception('Preset not found');
-    final data = doc.data()!;
-    final classId = (data['classId'] as String?) ?? '';
-    if (classId.isEmpty) throw Exception('Preset is missing its class');
-
-    final currentSnap = await _weekly.where('classId', isEqualTo: classId).get();
-    final previousTeacherIds = currentSnap.docs
-        .map((d) => (d.data()['teacherId'] as String?) ?? '')
-        .toSet();
-
-    final rawSlots = (data['slots'] as List?) ?? const [];
-    const batchLimit = 400;
-    for (var i = 0; i < rawSlots.length; i += batchLimit) {
-      final batch = _firestore.batch();
-      for (final raw in rawSlots.skip(i).take(batchLimit)) {
-        final entry = raw as Map<String, dynamic>;
-        final day = (entry['day'] as String?) ?? '';
-        final unit = (entry['unit'] as num?)?.toInt() ?? 0;
-        if (day.isEmpty || unit <= 0) continue;
-        final id = slotId(classId, day, unit);
-        batch.set(_weekly.doc(id), {
-          'teacherId': entry['teacherId'] ?? '',
-          'teacherName': entry['teacherName'] ?? '',
-          'originalTeacherId': entry['teacherId'] ?? '',
-          'type': 'permanent',
-          'restoredAt': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
+    for (final slotId in touchedSlotIds.toSet()) {
+      if (slotId.isEmpty) continue;
+      try {
+        await _reconcileStaleCoverForSlot(slotId);
+      } catch (_) {
+        // Best-effort per slot — one bad slot must never block the rest of
+        // a whole-school restore from being reconciled.
       }
-      await batch.commit();
     }
 
-    final restoredTeacherIds = rawSlots
-        .map((e) => ((e as Map<String, dynamic>)['teacherId'] as String?) ?? '')
-        .toSet();
-    final affected = <String>{...previousTeacherIds, ...restoredTeacherIds}
-      ..removeWhere((id) => id.isEmpty);
-    await _afterWeeklyAssignmentChanged(affected.toList());
+    // Slots that don't exist any more have nothing for
+    // _reconcileStaleCoverForSlot to read (it bails out on a missing
+    // weekly doc) — so any exception/fixture still pointing at them would
+    // otherwise become permanent ghost data. Clean those up directly,
+    // batched 30 at a time (Firestore's whereIn limit).
+    final idsToClean = deletedSlotIds.toSet().toList();
+    for (var i = 0; i < idsToClean.length; i += 30) {
+      final chunk = idsToClean.skip(i).take(30).toList();
+      if (chunk.isEmpty) continue;
+      try {
+        final excSnap =
+            await _exceptions.where('slotId', whereIn: chunk).get();
+        final batch = _firestore.batch();
+        for (final doc in excSnap.docs) {
+          final data = doc.data();
+          final type = (data['type'] as String?) ?? '';
+          final date = (data['date'] as String?) ?? '';
+          final slotId = (data['slotId'] as String?) ?? '';
+          if (type == 'fixture_assigned' && date.isNotEmpty && slotId.isNotEmpty) {
+            await _cancelStaleFixtureForSlotDate(slotId, date);
+          }
+          batch.delete(doc.reference);
+        }
+        if (excSnap.docs.isNotEmpty) await batch.commit();
+      } catch (_) {}
+    }
 
-    await _log('restore_timetable_preset', {
-      'classId': classId,
-      'presetId': presetId,
-      'slotCount': rawSlots.length,
-    });
+    await _afterWeeklyAssignmentChanged(touchedTeacherIds);
   }
 
   Future<void> createTimeProfile({

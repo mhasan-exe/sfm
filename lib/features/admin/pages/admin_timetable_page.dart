@@ -3,7 +3,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
-import 'package:intl/intl.dart';
 
 import '../../../core/services/admin_config_service.dart';
 import '../../../core/services/admin_service.dart';
@@ -17,6 +16,7 @@ import '../../../models/class_model.dart';
 import '../../../models/time_profile_model.dart';
 import '../../../models/timetable_slot_model.dart';
 import '../../../core/services/leave_service.dart';
+import 'admin_presets_page.dart';
 
 /// Process-wide cache of every teacher's busy (day, start, end) blocks
 /// across all classes, plus the school's max-units-per-teacher cap.
@@ -74,15 +74,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
   // kept from original file (not used in current UI logic)
   final _leaveService = LeaveService();
 
-
-  // There is no separate "Daily" mode any more — the grid always shows the
-  // permanent weekly pattern with whatever exception (leave/exchange/cover)
-  // applies to the currently-picked date layered on top, live. This flag
-  // stays internally (it's threaded through several widgets below as a
-  // display-only "show the date banner + overlay" switch) but is no longer
-  // user-toggleable.
-  final bool _showDaily = true;
-  DateTime _selectedDate = DateTime.now();
 
   bool _showQuotaConfigure = false;
   bool _savingQuotas = false;
@@ -146,17 +137,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
       );
     }
   }
-
-  Future<void> _onRefreshViewPressed(BuildContext context) async {
-    // Exceptions are written the moment a leave is approved, an exchange is
-    // confirmed, or a fixture is covered — there is no "materialize daily"
-    // step to run any more (the old `daily_timetables` collection this used
-    // to build is gone). This button now just nudges a rebuild, which is
-    // occasionally useful right after another admin's change.
-    if (mounted) setState(() {});
-  }
-
-  String get _dateKey => DateFormat('yyyy-MM-dd').format(_selectedDate);
 
   void _setClassTeacher(int index, bool value) {
     if (index < 0 || index >= _quotaTeachers.length) return;
@@ -234,160 +214,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
     }
   }
 
-  Future<void> _openPresetsDialog(BuildContext context) async {
-    final nameController = TextEditingController();
-    await showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF161616),
-      isScrollControlled: true,
-      builder: (sheetContext) {
-        return Padding(
-          padding: EdgeInsets.only(
-            left: 16,
-            right: 16,
-            top: 16,
-            bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Presets',
-                  style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700)),
-              const SizedBox(height: 4),
-              const Text(
-                'Save the current weekly schedule, or restore a saved one. Restoring overwrites the live weekly schedule for this class.',
-                style: TextStyle(color: Colors.white60, fontSize: 13),
-              ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: nameController,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: const InputDecoration(
-                        hintText: 'Preset name (e.g. "Before exams week")',
-                        hintStyle: TextStyle(color: Colors.white38),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton(
-                    onPressed: () async {
-                      final name = nameController.text.trim();
-                      if (name.isEmpty) return;
-                      try {
-                        await _timetable.saveWeeklyPreset(
-                          classId: widget.classId,
-                          name: name,
-                        );
-                        if (sheetContext.mounted) {
-                          ScaffoldMessenger.of(sheetContext).showSnackBar(
-                            SnackBar(content: Text('Saved preset "$name"')),
-                          );
-                        }
-                        nameController.clear();
-                      } catch (e) {
-                        if (sheetContext.mounted) {
-                          ScaffoldMessenger.of(sheetContext).showSnackBar(
-                            SnackBar(content: Text('Could not save preset: $e')),
-                          );
-                        }
-                      }
-                    },
-                    child: const Text('Save'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 320),
-                child: StreamBuilder<List<Map<String, dynamic>>>(
-                  stream: _timetable.watchPresets(widget.classId),
-                  builder: (context, snap) {
-                    final presets = snap.data ?? const [];
-                    if (presets.isEmpty) {
-                      return const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 12),
-                        child: Text('No presets saved yet.', style: TextStyle(color: Colors.white38)),
-                      );
-                    }
-                    return ListView.builder(
-                      shrinkWrap: true,
-                      itemCount: presets.length,
-                      itemBuilder: (context, i) {
-                        final preset = presets[i];
-                        final ts = preset['createdAt'];
-                        final dt = ts is Timestamp ? ts.toDate() : null;
-                        return ListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: Text(preset['name']?.toString() ?? 'Untitled',
-                              style: const TextStyle(color: Colors.white)),
-                          subtitle: Text(
-                            '${preset['slotCount'] ?? 0} slot(s)${dt != null ? ' • ${DateFormat('MMM d, yyyy h:mm a').format(dt)}' : ''}',
-                            style: const TextStyle(color: Colors.white38, fontSize: 12),
-                          ),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                icon: const Icon(Icons.restore, color: Colors.orange),
-                                tooltip: 'Restore',
-                                onPressed: () async {
-                                  final confirmed = await showDialog<bool>(
-                                    context: context,
-                                    builder: (ctx) => AlertDialog(
-                                      title: const Text('Restore this preset?'),
-                                      content: Text(
-                                          'This overwrites the current weekly schedule for this class with "${preset['name']}". This cannot be undone (unless you save another preset first).'),
-                                      actions: [
-                                        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-                                        ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Restore')),
-                                      ],
-                                    ),
-                                  );
-                                  if (confirmed != true) return;
-                                  try {
-                                    await _timetable.restorePreset(preset['id'] as String);
-                                    if (context.mounted) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        const SnackBar(content: Text('Preset restored.')),
-                                      );
-                                    }
-                                  } catch (e) {
-                                    if (context.mounted) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        SnackBar(content: Text('Could not restore preset: $e')),
-                                      );
-                                    }
-                                  }
-                                },
-                              ),
-                              IconButton(
-                                icon: const Icon(Icons.delete_outline, color: Colors.white38),
-                                tooltip: 'Delete',
-                                onPressed: () async {
-                                  try {
-                                    await _timetable.deletePreset(preset['id'] as String);
-                                  } catch (_) {}
-                                },
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return AppBackground(
@@ -398,8 +224,11 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
           actions: [
             IconButton(
               icon: const Icon(Icons.bookmarks_outlined),
-              tooltip: 'Presets',
-              onPressed: () => _openPresetsDialog(context),
+              tooltip: 'Presets (save/restore the whole school\'s timetable)',
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const AdminPresetsPage()),
+              ),
             ),
           ],
         ),
@@ -424,43 +253,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                   ),
                 ),
 
-                if (_showDaily)
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                    child: GlassCard(
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                'Showing: ${DateFormat('EEE, MMM dd').format(_selectedDate)}',
-                                style: Theme.of(context).textTheme.bodyLarge,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            ElevatedButton.icon(
-                              onPressed: () async {
-                                final now = DateTime.now();
-                                final picked = await showDatePicker(
-                                  context: context,
-                                  initialDate: _selectedDate,
-                                  firstDate: now.subtract(const Duration(days: 365)),
-                                  lastDate: now.add(const Duration(days: 365)),
-                                );
-                                if (picked == null) return;
-                                if (!mounted) return;
-                                setState(() => _selectedDate = picked);
-                              },
-                              icon: const Icon(Icons.calendar_month),
-                              label: const Text('Pick date'),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
                   child: GlassCard(
@@ -470,7 +262,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                         vertical: 10,
                       ),
                       child: Text(
-                        'This grid is the weekly schedule. Drag-and-drop edits are permanent. The picked date\'s leave/exchange/cover is layered on top live, just for preview — it never changes the permanent pattern.',
+                        'This is the permanent weekly schedule. Drag-and-drop edits here apply to every week.',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
                     ),
@@ -489,27 +281,12 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                               label: const Text('Generate Weekly'),
                             ),
                             const SizedBox(height: 8),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: OutlinedButton.icon(
-                                    onPressed: () => setState(
-                                      () => _showQuotaConfigure = !_showQuotaConfigure,
-                                    ),
-                                    icon: const Icon(Icons.tune),
-                                    label: const Text('Quotas'),
-                                  ),
-                                ),
-                                if (_showDaily) const SizedBox(width: 8),
-                                if (_showDaily)
-                                  Expanded(
-                                    child: ElevatedButton.icon(
-                                      onPressed: () => _onRefreshViewPressed(context),
-                                      icon: const Icon(Icons.refresh),
-                                      label: const Text('Refresh'),
-                                    ),
-                                  ),
-                              ],
+                            OutlinedButton.icon(
+                              onPressed: () => setState(
+                                () => _showQuotaConfigure = !_showQuotaConfigure,
+                              ),
+                              icon: const Icon(Icons.tune),
+                              label: const Text('Quotas'),
                             ),
                           ],
                         )
@@ -531,13 +308,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                               ),
                               icon: const Icon(Icons.tune),
                             ),
-                            if (_showDaily) const SizedBox(width: 4),
-                            if (_showDaily)
-                              ElevatedButton.icon(
-                                onPressed: () => _onRefreshViewPressed(context),
-                                icon: const Icon(Icons.refresh),
-                                label: const Text('Refresh'),
-                              ),
                           ],
                         ),
                 ),
@@ -784,8 +554,6 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                 Animate(
                   child: _TimetableGridView(
                     classId: widget.classId,
-                    showDaily: _showDaily,
-                    selectedDateKey: _dateKey,
                   ),
                 ).fadeIn(duration: 250.ms).slideY(begin: 0.05, end: 0),
                 ],
@@ -921,34 +689,24 @@ class _DraggableTeacherRoster extends StatelessWidget {
 
 class _TimetableGridView extends StatelessWidget {
   final String classId;
-  final bool showDaily;
-  final String selectedDateKey;
 
   const _TimetableGridView({
     required this.classId,
-    required this.showDaily,
-    required this.selectedDateKey,
   });
 
   @override
   Widget build(BuildContext context) {
     return _GridBuilder(
       classId: classId,
-      showDaily: showDaily,
-      selectedDateKey: selectedDateKey,
     );
   }
 }
 
 class _GridBuilder extends StatefulWidget {
   final String classId;
-  final bool showDaily;
-  final String selectedDateKey;
 
   const _GridBuilder({
     required this.classId,
-    required this.showDaily,
-    required this.selectedDateKey,
   });
 
   @override
@@ -980,71 +738,17 @@ class _GridBuilderState extends State<_GridBuilder> {
     });
   }
 
-
-
-  /// REPLACES the old "query a separate `daily_timetables` collection"
-  /// stream. There is no materialized daily collection any more — instead
-  /// this merges the live weekly stream with the live exceptions-for-date
-  /// stream and overlays one onto the other, exactly like the teacher's own
-  /// "today" view does. Important: the merged list's doc ids are still the
-  /// WEEKLY slot ids (never an exception id) — every assignment action in
-  /// this file independently recomputes `TimetableService().slotId(...)`
-  /// before writing, so this is purely a *display* concern.
+  /// Pure weekly schedule — no per-date overlay, no exceptions merge. The
+  /// permanent pattern IS what's shown and what's edited; there is no
+  /// "preview a different date" concept in this editor any more.
   Stream<List<TimetableSlotModel>> _buildStream() {
-    final weekly = FirebaseFirestore.instance
+    return FirebaseFirestore.instance
         .collection('weekly_timetables')
         .where('classId', isEqualTo: widget.classId)
-        .snapshots();
-
-    if (!widget.showDaily) {
-      return weekly.map((snap) => snap.docs
-          .map((d) => TimetableSlotModel.fromMap(d.id, d.data()))
-          .toList());
-    }
-
-    final exceptions = FirebaseFirestore.instance
-        .collection('timetable_exceptions')
-        .where('classId', isEqualTo: widget.classId)
-        .where('date', isEqualTo: widget.selectedDateKey)
-        .snapshots();
-
-    return Stream.multi((sink) {
-      List<QueryDocumentSnapshot<Map<String, dynamic>>> weeklyDocs = [];
-      List<QueryDocumentSnapshot<Map<String, dynamic>>> excDocs = [];
-
-      void emit() {
-        final excBySlotId = <String, Map<String, dynamic>>{};
-        for (final d in excDocs) {
-          final data = d.data();
-          excBySlotId[(data['slotId'] as String?) ?? d.id] = data;
-        }
-        final merged = weeklyDocs.map((d) {
-          final base = TimetableSlotModel.fromMap(d.id, d.data());
-          final exc = excBySlotId[d.id];
-          if (exc == null) return base;
-          return base.copyWith(
-            teacherId: (exc['teacherId'] as String?) ?? '',
-            teacherName: (exc['teacherName'] as String?) ?? '',
-            type: (exc['type'] as String?) ?? base.type,
-          );
-        }).toList();
-        sink.add(merged);
-      }
-
-      final s1 = weekly.listen((snap) {
-        weeklyDocs = snap.docs;
-        emit();
-      }, onError: sink.addError);
-      final s2 = exceptions.listen((snap) {
-        excDocs = snap.docs;
-        emit();
-      }, onError: sink.addError);
-
-      sink.onCancel = () async {
-        await s1.cancel();
-        await s2.cancel();
-      };
-    });
+        .snapshots()
+        .map((snap) => snap.docs
+            .map((d) => TimetableSlotModel.fromMap(d.id, d.data()))
+            .toList());
   }
 
   @override
@@ -1220,14 +924,12 @@ class _GridBuilderState extends State<_GridBuilder> {
                                               day: days[dayIndex],
                                               unit: unit,
                                               slotH: slotH,
-                                              showDaily: widget.showDaily,
                                               classId: widget.classId,
                                               startTime: slot.startTime,
                                               endTime: slot.endTime,
                                             )
                                           : _SlotCell(
                                               slot: slot,
-                                              showDaily: widget.showDaily,
                                               classId: widget.classId,
                                             ),
                                     ),
@@ -1252,7 +954,6 @@ class _EmptySlotCell extends StatelessWidget {
   final String day;
   final int unit;
   final double slotH;
-  final bool showDaily;
   final String classId;
   final String startTime;
   final String endTime;
@@ -1261,7 +962,6 @@ class _EmptySlotCell extends StatelessWidget {
     required this.day,
     required this.unit,
     required this.slotH,
-    required this.showDaily,
     required this.classId,
     this.startTime = '',
     this.endTime = '',
@@ -1435,7 +1135,7 @@ class _EmptySlotCell extends StatelessWidget {
                   Text(
                     isHovering
                         ? (isBusyHover ? 'Busy here' : 'Free')
-                        : (showDaily ? 'Add' : 'Add teacher'),
+                        : 'Add teacher',
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.65),
                       fontSize: 12,
@@ -1453,13 +1153,10 @@ class _EmptySlotCell extends StatelessWidget {
 
 class _SlotCell extends StatefulWidget {
   final TimetableSlotModel slot;
-  final bool showDaily;
   final String classId;
-
 
   const _SlotCell({
     required this.slot,
-    required this.showDaily,
     required this.classId,
   });
 
@@ -1577,11 +1274,7 @@ class _SlotCellState extends State<_SlotCell> {
   Widget build(BuildContext context) {
     final empty = widget.slot.teacherName.trim().isEmpty;
 
-    final cellColor = empty
-        ? Colors.transparent
-        : (widget.showDaily
-            ? Colors.orange.withValues(alpha: 0.13)
-            : Colors.blue.withValues(alpha: 0.13));
+    final cellColor = empty ? Colors.transparent : Colors.blue.withValues(alpha: 0.13);
 
     return DragTarget<String>(
       onAcceptWithDetails: (details) => _performAssign(details.data),
@@ -1623,7 +1316,6 @@ class _SlotCellState extends State<_SlotCell> {
                 builder: (ctx) => _SlotEditSheet(
                   classId: widget.classId,
                   slot: widget.slot,
-                  showDaily: widget.showDaily,
                 ),
               );
             },
@@ -1668,12 +1360,10 @@ class _SlotCellState extends State<_SlotCell> {
 class _SlotEditSheet extends StatefulWidget {
   final String classId;
   final TimetableSlotModel slot;
-  final bool showDaily;
 
   const _SlotEditSheet({
     required this.classId,
     required this.slot,
-    required this.showDaily,
   });
 
   @override

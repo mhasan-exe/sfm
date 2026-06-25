@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../../models/timetable_preset_model.dart';
+import 'timetable_service.dart';
 
 /// Save/load/rollback for whole-school timetable snapshots. Each preset
 /// stores every `weekly_timetables` document as-is in a `slots`
@@ -105,6 +106,18 @@ class TimetablePresetService {
     final presetSlotsSnap = await _presets.doc(presetId).collection('slots').get();
     final currentSnap = await _weekly.get();
 
+    // Captured BEFORE any writes below — needed afterwards so we know
+    // every teacherId/slotId that's about to change hands, in order to
+    // clean up whatever that change makes stale (leave exceptions tied to
+    // a teacher who no longer holds a slot, open fixtures for a vacancy a
+    // restored assignment just resolved). Restoring a preset is, from the
+    // schedule's point of view, just another way `weekly_timetables` can
+    // change out from under teachers/fixtures/leave exceptions — it needs
+    // the exact same reconciliation a manual assignment gets.
+    final previousTeacherBySlotId = {
+      for (final d in currentSnap.docs) d.id: (d.data()['teacherId'] as String?) ?? ''
+    };
+
     final presetIds = presetSlotsSnap.docs.map((d) => d.id).toSet();
     final toDelete =
         currentSnap.docs.where((d) => !presetIds.contains(d.id)).toList();
@@ -124,6 +137,37 @@ class TimetablePresetService {
         batch.set(_weekly.doc(d.id), d.data());
       }
       await batch.commit();
+    }
+
+    // Every slot that existed before OR after the restore, and every
+    // teacherId that lost or gained one — diffed against what each slot's
+    // teacherId actually was beforehand vs. what the preset says now.
+    final touchedSlotIds = <String>{};
+    final touchedTeacherIds = <String>{};
+    for (final d in restoreDocs) {
+      final newTeacherId = (d.data()['teacherId'] as String?) ?? '';
+      final oldTeacherId = previousTeacherBySlotId[d.id] ?? '';
+      if (newTeacherId != oldTeacherId) {
+        touchedSlotIds.add(d.id);
+      }
+      if (newTeacherId.isNotEmpty) touchedTeacherIds.add(newTeacherId);
+      if (oldTeacherId.isNotEmpty) touchedTeacherIds.add(oldTeacherId);
+    }
+    for (final d in toDelete) {
+      final oldTeacherId = previousTeacherBySlotId[d.id] ?? '';
+      if (oldTeacherId.isNotEmpty) touchedTeacherIds.add(oldTeacherId);
+    }
+
+    try {
+      await TimetableService().reconcileAfterBulkWeeklyRewrite(
+        touchedSlotIds: touchedSlotIds.toList(),
+        touchedTeacherIds: touchedTeacherIds.toList(),
+        deletedSlotIds: toDelete.map((d) => d.id).toList(),
+      );
+    } catch (_) {
+      // Best-effort — the restore itself already committed; worst case an
+      // admin needs to hit "Resync schedule" for an affected teacher
+      // afterwards, same recovery path leave approval already has.
     }
 
     await FirebaseFirestore.instance.collection('audit_logs').add({
