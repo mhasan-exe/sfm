@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../../../core/services/admin_config_service.dart';
 import '../../../core/services/fixture_service.dart';
+import '../../../core/services/user_service.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/app_background.dart';
 import '../../../core/widgets/glass_card.dart';
@@ -52,8 +53,8 @@ class _AdminFixtureManagementPageState extends State<AdminFixtureManagementPage>
     }
   }
 
-  int _teacherUnits(Map<String, dynamic> teacher) {
-    final defaultUnits = (teacher['defaultUnits'] as num?)?.toInt() ?? 0;
+  int _teacherUnits(Map<String, dynamic> teacher, Map<String, int> livePermanentUnits) {
+    final defaultUnits = livePermanentUnits[teacher['uid']?.toString() ?? ''] ?? 0;
     final fixtureUnits = (teacher['fixtureUnits'] as num?)?.toInt() ?? 0;
     return defaultUnits + fixtureUnits;
   }
@@ -73,6 +74,10 @@ class _AdminFixtureManagementPageState extends State<AdminFixtureManagementPage>
     );
     final recommended = await fixtureService.getRecommendedTeachers(fixtureModel, limit: 5);
     final recommendedIds = recommended.map((r) => r['teacherId'] as String).toSet();
+    // One bulk query for every teacher's REAL permanent unit count — see
+    // UserService.getLivePermanentUnitsForAllTeachers for why this can't
+    // just be read off each teacher's `defaultUnits` field.
+    final livePermanentUnits = await UserService().getLivePermanentUnitsForAllTeachers();
 
     if (!mounted) return;
 
@@ -96,7 +101,7 @@ class _AdminFixtureManagementPageState extends State<AdminFixtureManagementPage>
             builder: (context, setDialogState) {
               final teacherWidgets = teachers.map<Widget>((doc) {
                 final teacher = doc.data();
-                final units = _teacherUnits(teacher);
+                final units = _teacherUnits(teacher, livePermanentUnits);
                 final isDisabled = units >= maxUnits;
                 final isRecommended = recommendedIds.contains(doc.id);
 

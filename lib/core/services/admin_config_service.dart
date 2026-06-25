@@ -153,7 +153,13 @@ class AdminConfigService {
     );
   }
 
-  // Manual trigger for workload reset
+  // Manual trigger for workload reset.
+  //
+  // Only `fixtureUnits` is meaningfully reset here. `defaultUnits` is no
+  // longer read from the stored field anywhere in the app — it's always
+  // computed live from `weekly_timetables` (see
+  // UserService.getLivePermanentUnits) — so continuing to zero it here
+  // would silently do nothing while the button claimed otherwise.
   Future<void> triggerWorkloadReset({
     required String triggeredBy,
   }) async {
@@ -163,7 +169,7 @@ class AdminConfigService {
       'timestamp': FieldValue.serverTimestamp(),
     });
 
-    // Reset all teacher workload (units)
+    // Reset all teacher fixture-cover unit counts.
     final usersSnapshot = await FirebaseFirestore.instance
         .collection('users')
         .get();
@@ -172,7 +178,6 @@ class AdminConfigService {
 
     for (final userDoc in usersSnapshot.docs) {
       batch.update(userDoc.reference, {
-        'defaultUnits': 0,
         'fixtureUnits': 0,
         'lastResetAt': FieldValue.serverTimestamp(),
       });

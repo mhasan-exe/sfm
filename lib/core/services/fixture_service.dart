@@ -29,6 +29,22 @@ class FixtureService {
     return '${sourceSlotId}_$date';
   }
 
+  /// The REAL count of a teacher's permanent weekly teaching load,
+  /// computed live from `weekly_timetables` — NOT the `defaultUnits` field
+  /// on their user doc, which nothing in the app ever recalculates when
+  /// their schedule changes (the only thing that ever touches it is a
+  /// workload reset, which zeroes it). Every quota check in this file used
+  /// to read that stale field, meaning a teacher's real eligibility to
+  /// claim more cover had no relationship to their actual timetable.
+  Future<int> _livePermanentUnits(String teacherId) async {
+    if (teacherId.isEmpty) return 0;
+    final snap = await FirebaseFirestore.instance
+        .collection('weekly_timetables')
+        .where('teacherId', isEqualTo: teacherId)
+        .get();
+    return snap.docs.length;
+  }
+
   // Create fixtures for uncovered slots (no assigned teacher)
   //
   // Each entry in uncoveredSlots may include:
@@ -267,7 +283,7 @@ class FixtureService {
       throw Exception('Teacher not found');
     }
     final user = userDoc.data()!;
-    final defaultUnits = user['defaultUnits'] as int? ?? 0;
+    final defaultUnits = await _livePermanentUnits(teacherId);
     final fixtureUnits = user['fixtureUnits'] as int? ?? 0;
     final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
     if (defaultUnits + fixtureUnits >= maxUnits) {
@@ -432,8 +448,7 @@ class FixtureService {
     if (!userDoc.exists) {
       throw Exception('Teacher not found');
     }
-    final user = userDoc.data()!;
-    final defaultUnits = user['defaultUnits'] as int? ?? 0;
+    final defaultUnits = await _livePermanentUnits(teacherId);
     final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
 
     String? previousHolder;
@@ -864,11 +879,24 @@ class FixtureService {
       }
     }
 
+    // Live permanent-unit count per teacher, computed from the WHOLE
+    // weekly_timetables collection (not just this fixture's day) — one
+    // query, reused for every candidate below instead of trusting each
+    // user's never-synced `defaultUnits` field.
+    final allWeeklySnap =
+        await FirebaseFirestore.instance.collection('weekly_timetables').get();
+    final livePermanentUnits = <String, int>{};
+    for (final d in allWeeklySnap.docs) {
+      final tId = (d.data()['teacherId'] as String?) ?? '';
+      if (tId.isEmpty) continue;
+      livePermanentUnits[tId] = (livePermanentUnits[tId] ?? 0) + 1;
+    }
+
     final candidates = <Map<String, dynamic>>[];
     for (final doc in usersSnap.docs) {
       final data = doc.data();
       if (busyTeacherIds.contains(doc.id) || onLeaveIds.contains(doc.id)) continue;
-      final defaultUnits = (data['defaultUnits'] as num?)?.toInt() ?? 0;
+      final defaultUnits = livePermanentUnits[doc.id] ?? 0;
       final fixtureUnits = (data['fixtureUnits'] as num?)?.toInt() ?? 0;
       final total = defaultUnits + fixtureUnits;
       if (total >= maxUnits) continue;
@@ -1014,8 +1042,7 @@ class FixtureService {
     if (!recipientDoc.exists) {
       throw Exception('Recipient teacher not found');
     }
-    final recipient = recipientDoc.data()!;
-    final defaultUnits = recipient['defaultUnits'] as int? ?? 0;
+    final defaultUnits = await _livePermanentUnits(toTeacherId);
     final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
 
     Map<String, dynamic>? committedFixture;

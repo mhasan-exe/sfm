@@ -57,30 +57,48 @@ class ProfilesScreen extends StatelessWidget {
               return const Center(child: Text('No Teachers Found'));
             }
 
-            return LayoutBuilder(
-              builder: (context, constraints) {
-                final isWide = constraints.maxWidth > 900;
-                final crossAxisCount = isWide ? 3 : 1;
+            // Live, computed-from-weekly_timetables permanent unit count
+            // for every teacher in ONE query — this is the actual fix for
+            // "profile page doesn't show calculated units". The
+            // `defaultUnits` field on each teacher's user doc is never
+            // recalculated when their schedule changes (see UserService
+            // for the full story), so the cards used to always show
+            // whatever it was last manually reset to — usually 0.
+            return FutureBuilder<Map<String, int>>(
+              future: UserService().getLivePermanentUnitsForAllTeachers(),
+              builder: (context, unitsSnap) {
+                final liveUnits = unitsSnap.data ?? const {};
 
-                return GridView.builder(
-                  padding: AppTheme.pagePadding(context),
-                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: crossAxisCount,
-                    crossAxisSpacing: 16,
-                    mainAxisSpacing: 16,
-                    // A fixed, generous height instead of an aspect ratio: the
-                    // card's content (avatar row + two stat chips + a progress
-                    // bar + two action buttons) doesn't scale with width, so a
-                    // ratio-based height was overflowing on narrower phones.
-                    mainAxisExtent: 268,
-                  ),
-                  itemCount: teachers.length,
-                  itemBuilder: (context, index) {
-                    final teacher = teachers[index];
-                    return _TeacherCard(teacher: teacher, maxUnits: maxUnits)
-                        .animate()
-                        .fadeIn(duration: 400.ms)
-                        .slideY(begin: 0.1);
+                return LayoutBuilder(
+                  builder: (context, constraints) {
+                    final isWide = constraints.maxWidth > 900;
+                    final crossAxisCount = isWide ? 3 : 1;
+
+                    return GridView.builder(
+                      padding: AppTheme.pagePadding(context),
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: crossAxisCount,
+                        crossAxisSpacing: 16,
+                        mainAxisSpacing: 16,
+                        // A fixed, generous height instead of an aspect ratio: the
+                        // card's content (avatar row + two stat chips + a progress
+                        // bar + two action buttons) doesn't scale with width, so a
+                        // ratio-based height was overflowing on narrower phones.
+                        mainAxisExtent: 268,
+                      ),
+                      itemCount: teachers.length,
+                      itemBuilder: (context, index) {
+                        final teacher = teachers[index];
+                        return _TeacherCard(
+                          teacher: teacher,
+                          maxUnits: maxUnits,
+                          livePermanentUnits: liveUnits[teacher.uid] ?? 0,
+                        )
+                            .animate()
+                            .fadeIn(duration: 400.ms)
+                            .slideY(begin: 0.1);
+                      },
+                    );
                   },
                 );
               },
@@ -95,8 +113,13 @@ class ProfilesScreen extends StatelessWidget {
 class _TeacherCard extends StatelessWidget {
   final UserModel teacher;
   final int maxUnits;
+  final int livePermanentUnits;
 
-  const _TeacherCard({required this.teacher, required this.maxUnits});
+  const _TeacherCard({
+    required this.teacher,
+    required this.maxUnits,
+    required this.livePermanentUnits,
+  });
 
   void _openTimetable(BuildContext context) {
     Navigator.of(context).push(
@@ -113,7 +136,7 @@ class _TeacherCard extends StatelessWidget {
   }
 
   void _showProfileSheet(BuildContext context) {
-    final total = teacher.defaultUnits + teacher.fixtureUnits;
+    final total = livePermanentUnits + teacher.fixtureUnits;
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
@@ -144,7 +167,7 @@ class _TeacherCard extends StatelessWidget {
             ),
             const SizedBox(height: 20),
             _detailRow('Role', teacher.role),
-            _detailRow('Default units / week', '${teacher.defaultUnits}'),
+            _detailRow('Permanent units / week', '$livePermanentUnits'),
             _detailRow('Fixture (cover) units / week', '${teacher.fixtureUnits}'),
             _detailRow('Total weekly load', '$total / $maxUnits'),
             const SizedBox(height: 16),
@@ -180,7 +203,7 @@ class _TeacherCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final total = teacher.defaultUnits + teacher.fixtureUnits;
+    final total = livePermanentUnits + teacher.fixtureUnits;
 
     return GlassCard(
       child: Padding(
@@ -226,7 +249,7 @@ class _TeacherCard extends StatelessWidget {
             Row(
               children: [
                 Expanded(
-                  child: _StatChip(title: 'Default', value: '${teacher.defaultUnits}', color: Colors.amber),
+                  child: _StatChip(title: 'Permanent', value: '$livePermanentUnits', color: Colors.amber),
                 ),
                 const SizedBox(width: 10),
                 Expanded(

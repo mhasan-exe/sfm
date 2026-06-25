@@ -218,8 +218,8 @@ class _AdminConfigPageState extends State<AdminConfigPage> {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Reset Workload Counters'),
-        content: const Text('This zeroes every teacher\'s default/fixture unit counts. Continue?'),
+        title: const Text('Reset Fixture-Cover Counters'),
+        content: const Text('This zeroes every teacher\'s fixture (cover) unit count. Their permanent weekly load is always computed live from the actual timetable and is unaffected. Continue?'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
           ElevatedButton(

@@ -101,16 +101,67 @@ class UserService {
     });
   }
 
+  // ---------------------------------------------------------------------
+  // Live workload — REPLACES trusting the `defaultUnits` field.
+  //
+  // THE BUG: `defaultUnits` on the user doc is a manually-maintained
+  // counter. Nothing in the app — not assignTeacher, not exchangeSlots,
+  // not the generator, not preset restore — ever increments or
+  // decrements it when a teacher's actual weekly_timetables assignments
+  // change. The ONLY code that ever touches it is the workload-reset
+  // flow, which zeroes it. So every screen reading `teacher.defaultUnits`
+  // (Profiles cards, fixture-claim quota checks, the "prefer least loaded
+  // teacher" sort) was reading a number with no relationship to reality —
+  // usually 0 forever, since nothing ever sets it back up.
+  //
+  // THE FIX: compute it live from `weekly_timetables`, the actual source
+  // of truth for what a teacher teaches, every time it's needed. One
+  // query for the whole school's teachers at once where possible, so
+  // this stays cheap even on a list screen.
+  // ---------------------------------------------------------------------
+
+  /// Every teacher's CURRENT permanent weekly unit count, computed
+  /// directly from `weekly_timetables` in a single query. Use this (not
+  /// `user.defaultUnits`) anywhere multiple teachers' workload is shown
+  /// or compared at once (Profiles grid, "least loaded" sort, etc).
+  Future<Map<String, int>> getLivePermanentUnitsForAllTeachers() async {
+    final snap = await firestore.collection('weekly_timetables').get();
+    final counts = <String, int>{};
+    for (final doc in snap.docs) {
+      final teacherId = (doc.data()['teacherId'] as String?) ?? '';
+      if (teacherId.isEmpty) continue;
+      counts[teacherId] = (counts[teacherId] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  /// Same as above for a single teacher — slightly more expensive than
+  /// the bulk version if you need more than one teacher's count, but
+  /// fine for a single profile/detail view.
+  Future<int> getLivePermanentUnits(String uid) async {
+    final snap = await firestore
+        .collection('weekly_timetables')
+        .where('teacherId', isEqualTo: uid)
+        .get();
+    return snap.docs.length;
+  }
+
   // Get teacher workload
   Future<Map<String, dynamic>> getTeacherWorkload(String uid) async {
     final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
     final doc = await _users.doc(uid).get();
+    final defaultUnits = await getLivePermanentUnits(uid);
     if (!doc.exists) {
-      return {'defaultUnits': 0, 'fixtureUnits': 0, 'totalUnits': 0, 'availableSlots': maxUnits, 'maxUnits': maxUnits};
+      return {
+        'defaultUnits': defaultUnits,
+        'fixtureUnits': 0,
+        'totalUnits': defaultUnits,
+        'availableSlots': maxUnits - defaultUnits,
+        'maxUnits': maxUnits,
+      };
     }
 
     final user = doc.data()!;
-    final defaultUnits = user['defaultUnits'] as int? ?? 0;
     final fixtureUnits = user['fixtureUnits'] as int? ?? 0;
 
     return {
@@ -122,24 +173,30 @@ class UserService {
     };
   }
 
-  // Stream teacher workload. Re-reads the configurable quota each time the
-  // user doc changes — cheap, and means a Settings change is reflected on
-  // the next snapshot without the screen needing a manual refresh.
+  // Stream teacher workload. Re-reads the configurable quota AND the live
+  // permanent-units count each time the user doc changes — cheap, and
+  // means both a Settings change and a schedule change are reflected on
+  // the next snapshot without the screen needing a manual refresh. Note:
+  // this only re-fires on a `users/{uid}` doc change (e.g. fixtureUnits
+  // changing), not on every weekly_timetables write — for a screen that
+  // needs to react live to schedule edits too, prefer one-shot
+  // [getTeacherWorkload] on a timer/refresh, or layer your own
+  // weekly_timetables stream alongside this one.
   Stream<Map<String, dynamic>> watchTeacherWorkload(String uid) {
     return _users.doc(uid).snapshots().asyncMap((doc) async {
       final maxUnits = await _adminConfig.getMaxUnitsPerTeacher();
+      final defaultUnits = await getLivePermanentUnits(uid);
       if (!doc.exists) {
         return {
-          'defaultUnits': 0,
+          'defaultUnits': defaultUnits,
           'fixtureUnits': 0,
-          'totalUnits': 0,
-          'availableSlots': maxUnits,
+          'totalUnits': defaultUnits,
+          'availableSlots': maxUnits - defaultUnits,
           'maxUnits': maxUnits,
         };
       }
 
       final user = doc.data()!;
-      final defaultUnits = user['defaultUnits'] as int? ?? 0;
       final fixtureUnits = user['fixtureUnits'] as int? ?? 0;
 
       return {
@@ -153,16 +210,18 @@ class UserService {
   }
 
   // Get free teachers (available for fixtures)
-  Future<List<UserModel>> getAvailableTeachers({int? maxUnitsPerTeacher}) async {    final maxUnits = maxUnitsPerTeacher ?? await _adminConfig.getMaxUnitsPerTeacher();
+  Future<List<UserModel>> getAvailableTeachers({int? maxUnitsPerTeacher}) async {
+    final maxUnits = maxUnitsPerTeacher ?? await _adminConfig.getMaxUnitsPerTeacher();
     final snapshot = await _users
         .where('role', isEqualTo: 'teacher')
         .get();
+    final liveUnits = await getLivePermanentUnitsForAllTeachers();
 
     final available = <UserModel>[];
 
     for (final doc in snapshot.docs) {
       final user = UserModel.fromMap(doc.data());
-      final workload = user.defaultUnits + user.fixtureUnits;
+      final workload = (liveUnits[user.uid] ?? 0) + user.fixtureUnits;
 
       if (workload < maxUnits) {
         available.add(user);
@@ -178,18 +237,20 @@ class UserService {
     final snapshot = await _users
         .where('role', isEqualTo: 'teacher')
         .get();
+    final liveUnits = await getLivePermanentUnitsForAllTeachers();
 
     final teachers = <Map<String, dynamic>>[];
 
     for (final doc in snapshot.docs) {
       final user = UserModel.fromMap(doc.data());
-      final workload = user.defaultUnits + user.fixtureUnits;
+      final defaultUnits = liveUnits[user.uid] ?? 0;
+      final workload = defaultUnits + user.fixtureUnits;
 
       teachers.add({
         'uid': user.uid,
         'name': user.name,
         'email': user.email,
-        'defaultUnits': user.defaultUnits,
+        'defaultUnits': defaultUnits,
         'fixtureUnits': user.fixtureUnits,
         'totalUnits': workload,
         'availableSlots': maxUnits - workload,
@@ -204,10 +265,15 @@ class UserService {
     return teachers;
   }
 
-  // Reset teacher workload
+  // Reset teacher workload. Only `fixtureUnits` is meaningful to reset —
+  // `defaultUnits` is no longer read from the stored field anywhere (see
+  // getLivePermanentUnits above), it's always computed live from
+  // weekly_timetables, so zeroing it here would do nothing except leave
+  // a misleading number sitting in Firestore. The field is left alone
+  // (not deleted) for any external reporting that might still reference
+  // it, but the app itself never trusts it again after this fix.
   Future<void> resetTeacherWorkload(String uid) async {
     await _users.doc(uid).update({
-      'defaultUnits': 0,
       'fixtureUnits': 0,
       'lastResetAt': FieldValue.serverTimestamp(),
     });
@@ -223,7 +289,6 @@ class UserService {
 
     for (final doc in snapshot.docs) {
       batch.update(doc.reference, {
-        'defaultUnits': 0,
         'fixtureUnits': 0,
         'lastResetAt': FieldValue.serverTimestamp(),
       });

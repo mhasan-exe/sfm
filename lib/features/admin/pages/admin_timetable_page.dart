@@ -262,7 +262,7 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
                         vertical: 10,
                       ),
                       child: Text(
-                        'This is the permanent weekly schedule. Drag-and-drop edits here apply to every week.',
+                        'This is the permanent weekly schedule — drag-and-drop edits apply to every week. A cell showing "On leave today" or "Covering today" is today\'s exception only; the permanent assignment underneath is unchanged unless you edit it here.',
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
                     ),
@@ -738,17 +738,65 @@ class _GridBuilderState extends State<_GridBuilder> {
     });
   }
 
-  /// Pure weekly schedule — no per-date overlay, no exceptions merge. The
-  /// permanent pattern IS what's shown and what's edited; there is no
-  /// "preview a different date" concept in this editor any more.
+  /// Edits always go straight to `weekly_timetables` — that part never
+  /// changed and there's still no date picker. But the grid you SEE needs
+  /// to reflect reality: if a slot's assigned teacher has approved leave
+  /// today, it should show as open/vacant *today*, automatically, with no
+  /// button to press and no mode to switch into. So this merges the
+  /// permanent weekly pattern with whatever `timetable_exceptions` exist
+  /// for today's date — recomputed live, every time either stream updates.
+  /// Tomorrow this automatically shows tomorrow's reality once today
+  /// becomes yesterday; there's nothing to remember to refresh.
   Stream<List<TimetableSlotModel>> _buildStream() {
-    return FirebaseFirestore.instance
+    final todayKey = _timetable.dateKeyFor(DateTime.now());
+
+    final weekly = FirebaseFirestore.instance
         .collection('weekly_timetables')
         .where('classId', isEqualTo: widget.classId)
-        .snapshots()
-        .map((snap) => snap.docs
-            .map((d) => TimetableSlotModel.fromMap(d.id, d.data()))
-            .toList());
+        .snapshots();
+    final exceptionsToday = FirebaseFirestore.instance
+        .collection('timetable_exceptions')
+        .where('classId', isEqualTo: widget.classId)
+        .where('date', isEqualTo: todayKey)
+        .snapshots();
+
+    return Stream.multi((sink) {
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> weeklyDocs = [];
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> excDocs = [];
+
+      void emit() {
+        final excBySlotId = <String, Map<String, dynamic>>{};
+        for (final d in excDocs) {
+          final data = d.data();
+          excBySlotId[(data['slotId'] as String?) ?? d.id] = data;
+        }
+        final merged = weeklyDocs.map((d) {
+          final base = TimetableSlotModel.fromMap(d.id, d.data());
+          final exc = excBySlotId[d.id];
+          if (exc == null) return base;
+          return base.copyWith(
+            teacherId: (exc['teacherId'] as String?) ?? '',
+            teacherName: (exc['teacherName'] as String?) ?? '',
+            type: (exc['type'] as String?) ?? base.type,
+          );
+        }).toList();
+        sink.add(merged);
+      }
+
+      final s1 = weekly.listen((snap) {
+        weeklyDocs = snap.docs;
+        emit();
+      }, onError: sink.addError);
+      final s2 = exceptionsToday.listen((snap) {
+        excDocs = snap.docs;
+        emit();
+      }, onError: sink.addError);
+
+      sink.onCancel = () async {
+        await s1.cancel();
+        await s2.cancel();
+      };
+    });
   }
 
   @override
@@ -927,6 +975,7 @@ class _GridBuilderState extends State<_GridBuilder> {
                                               classId: widget.classId,
                                               startTime: slot.startTime,
                                               endTime: slot.endTime,
+                                              isLeaveToday: slot.type == 'leave',
                                             )
                                           : _SlotCell(
                                               slot: slot,
@@ -957,6 +1006,7 @@ class _EmptySlotCell extends StatelessWidget {
   final String classId;
   final String startTime;
   final String endTime;
+  final bool isLeaveToday;
 
   const _EmptySlotCell({
     required this.day,
@@ -965,6 +1015,7 @@ class _EmptySlotCell extends StatelessWidget {
     required this.classId,
     this.startTime = '',
     this.endTime = '',
+    this.isLeaveToday = false,
   });
 
   Future<void> _assign(BuildContext context) async {
@@ -1106,14 +1157,16 @@ class _EmptySlotCell extends StatelessWidget {
           height: slotH,
           decoration: BoxDecoration(
             color: !isHovering
-                ? null
+                ? (isLeaveToday ? Colors.redAccent.withValues(alpha: 0.10) : null)
                 : (isBusyHover
                     ? Colors.redAccent.withValues(alpha: 0.18)
                     : Colors.greenAccent.withValues(alpha: 0.16)),
             borderRadius: BorderRadius.circular(8),
             border: isHovering
                 ? Border.all(color: isBusyHover ? Colors.redAccent : Colors.greenAccent, width: 1.4)
-                : null,
+                : (isLeaveToday
+                    ? Border.all(color: Colors.redAccent.withValues(alpha: 0.4), width: 1)
+                    : null),
           ),
           child: InkWell(
             onTap: () => _assign(context),
@@ -1126,7 +1179,7 @@ class _EmptySlotCell extends StatelessWidget {
                     style: TextStyle(
                       color: isHovering
                           ? (isBusyHover ? Colors.redAccent : Colors.greenAccent)
-                          : const Color(0x99FFFFFF),
+                          : (isLeaveToday ? Colors.redAccent : const Color(0x99FFFFFF)),
                       fontSize: 20,
                       fontWeight: FontWeight.w800,
                     ),
@@ -1135,9 +1188,11 @@ class _EmptySlotCell extends StatelessWidget {
                   Text(
                     isHovering
                         ? (isBusyHover ? 'Busy here' : 'Free')
-                        : 'Add teacher',
+                        : (isLeaveToday ? 'On leave today' : 'Add teacher'),
                     style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.65),
+                      color: isLeaveToday && !isHovering
+                          ? Colors.redAccent
+                          : Colors.white.withValues(alpha: 0.65),
                       fontSize: 12,
                     ),
                   ),
@@ -1273,8 +1328,16 @@ class _SlotCellState extends State<_SlotCell> {
   @override
   Widget build(BuildContext context) {
     final empty = widget.slot.teacherName.trim().isEmpty;
+    // 'permanent' = today matches the weekly pattern as-is. Anything else
+    // ('leave', 'fixture_assigned', 'exchange') means today's exception
+    // overlay changed what this cell shows vs. the permanent assignment.
+    final isTodayOverride = widget.slot.type != 'permanent';
 
-    final cellColor = empty ? Colors.transparent : Colors.blue.withValues(alpha: 0.13);
+    final cellColor = empty
+        ? (isTodayOverride ? Colors.redAccent.withValues(alpha: 0.10) : Colors.transparent)
+        : (isTodayOverride
+            ? Colors.orange.withValues(alpha: 0.16)
+            : Colors.blue.withValues(alpha: 0.13));
 
     return DragTarget<String>(
       onAcceptWithDetails: (details) => _performAssign(details.data),
@@ -1302,7 +1365,9 @@ class _SlotCellState extends State<_SlotCell> {
             border: Border.all(
               color: isHovering
                   ? (isBusyHover ? Colors.redAccent : Colors.greenAccent)
-                  : (empty ? Colors.transparent : Colors.white.withValues(alpha: 0.18)),
+                  : (empty
+                      ? (isTodayOverride ? Colors.redAccent.withValues(alpha: 0.4) : Colors.transparent)
+                      : Colors.white.withValues(alpha: 0.18)),
               width: isHovering ? 1.4 : 1,
             ),
           ),
@@ -1323,11 +1388,14 @@ class _SlotCellState extends State<_SlotCell> {
               alignment: Alignment.centerLeft,
               child: empty
                   ? Text(
-                      isHovering ? (isBusyHover ? 'Busy' : 'Free') : '—',
+                      isHovering
+                          ? (isBusyHover ? 'Busy' : 'Free')
+                          : (isTodayOverride ? 'On leave today' : '—'),
                       style: TextStyle(
                         color: isHovering
                             ? (isBusyHover ? Colors.redAccent : Colors.greenAccent)
-                            : const Color(0x99FFFFFF),
+                            : (isTodayOverride ? Colors.redAccent : const Color(0x99FFFFFF)),
+                        fontSize: isTodayOverride && !isHovering ? 11 : null,
                       ),
                     )
                   : Column(
@@ -1342,10 +1410,15 @@ class _SlotCellState extends State<_SlotCell> {
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          '${widget.slot.startTime}${widget.slot.startTime.isEmpty ? '' : ' - '}${widget.slot.endTime}',
+                          isTodayOverride
+                              ? 'Covering today'
+                              : '${widget.slot.startTime}${widget.slot.startTime.isEmpty ? '' : ' - '}${widget.slot.endTime}',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 12, color: Colors.white70),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isTodayOverride ? Colors.orangeAccent : Colors.white70,
+                          ),
                         ),
                       ],
                     ),
@@ -1480,6 +1553,22 @@ class _SlotEditSheetState extends State<_SlotEditSheet> {
                 Chip(label: Text(empty ? 'Empty' : 'Assigned')),
               ],
             ),
+            if (widget.slot.type != 'permanent') ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  empty
+                      ? 'This is today only — the teacher normally assigned here is on approved leave today. The permanent weekly assignment is unchanged.'
+                      : 'The name shown is today\'s cover/exchange, not the permanent assignment. Assigning a teacher below changes the PERMANENT weekly slot, not just today.',
+                  style: const TextStyle(color: Colors.orangeAccent, fontSize: 12.5),
+                ),
+              ),
+            ],
             const SizedBox(height: 14),
             TextField(
               controller: _startController,

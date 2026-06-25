@@ -5,6 +5,7 @@ import '../../core/widgets/app_background.dart';
 import '../../core/widgets/glass_card.dart';
 
 import '../../core/services/timetable_service.dart';
+import '../../core/services/user_service.dart';
 
 
 class TimetableEditorScreen extends StatefulWidget {
@@ -258,6 +259,13 @@ for (final doc in docs.cast<QueryDocumentSnapshot<Object?>>()) {
         .where('role', isEqualTo: 'teacher')
         .get();
 
+    // Live permanent-unit count per teacher, computed from the actual
+    // weekly_timetables collection — NOT the `defaultUnits` field on each
+    // user doc, which is never recalculated when a teacher's schedule
+    // changes (see UserService.getLivePermanentUnits for the full story).
+    // One query, reused for every candidate below.
+    final livePermanentUnits = await UserService().getLivePermanentUnitsForAllTeachers();
+
     // Fetch existing slots for each teacher on this day.
     // Then compute consecutive penalty: if teacher already has unit-1 or unit+1,
     // penalize.
@@ -269,7 +277,7 @@ for (final doc in docs.cast<QueryDocumentSnapshot<Object?>>()) {
       final data = doc.data();
       final teacherId = doc.id;
       final teacherName = data['name']?.toString() ?? 'Unknown';
-      final defaultUnits = (data['defaultUnits'] as num?)?.toInt() ?? 0;
+      final defaultUnits = livePermanentUnits[teacherId] ?? 0;
       final fixtureUnits = (data['fixtureUnits'] as num?)?.toInt() ?? 0;
       final workload = defaultUnits + fixtureUnits;
 
