@@ -1,0 +1,17 @@
+{
+  "name": "functions",
+  "description": "Cloud Functions for the school timetable app — owns every write that needs to be trusted regardless of which user's session triggers it (claim/release/assign/exchange a fixture, and the periodic expiry sweep), instead of those writes happening directly from client Firestore calls.",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "scripts": {
+    "lint": "true",
+    "deploy": "firebase deploy --only functions"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.1.0",
+    "firebase-functions": "^5.0.0"
+  },
+  "private": true
+}
