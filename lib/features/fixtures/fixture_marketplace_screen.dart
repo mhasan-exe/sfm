@@ -266,6 +266,7 @@ class _FixtureMarketplaceScreenState extends State<FixtureMarketplaceScreen>
                 fixtures[i],
                 userId,
                 onRelease: () => _releaseFixture(fixtures[i], userId),
+                onExchange: () => _exchangeFixture(fixtures[i], userId),
                 delay: i * 50,
               ),
           ],
@@ -514,6 +515,7 @@ class _FixtureMarketplaceScreenState extends State<FixtureMarketplaceScreen>
     DocumentSnapshot fixture,
     String userId, {
     required VoidCallback onRelease,
+    required VoidCallback onExchange,
     required int delay,
   }) {
     final data = fixture.data() as Map;
@@ -579,13 +581,24 @@ class _FixtureMarketplaceScreenState extends State<FixtureMarketplaceScreen>
               ),
             ),
             const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: onRelease,
-                icon: const Icon(Icons.close),
-                label: const Text('Release Claim'),
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: onExchange,
+                    icon: const Icon(Icons.swap_horiz),
+                    label: const Text('Hand off'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: onRelease,
+                    icon: const Icon(Icons.close),
+                    label: const Text('Release'),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -764,6 +777,103 @@ await _loggingService.logFixtureEvent(
         );
       }
     }
+  }
+
+  Future<void> _exchangeFixture(DocumentSnapshot fixture, String userId) async {
+    final fixtureId = fixture.id;
+    final data = fixture.data() as Map;
+    final className = data['className'] as String? ?? 'this class';
+
+    final picked = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (ctx) => _TeacherHandoffDialog(excludeUid: userId, className: className),
+    );
+    if (picked == null) return;
+
+    try {
+      await _fixtureService.exchangeFixture(
+        fixtureId: fixtureId,
+        fromTeacherId: userId,
+        fromTeacherName: _auth.currentUser?.email?.split('@')[0] ?? 'Teacher',
+        toTeacherId: picked['uid']!,
+        toTeacherName: picked['name']!,
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Handed $className off to ${picked['name']}'),
+            backgroundColor: Colors.blue,
+          ),
+        );
+      }
+
+      await _loggingService.logFixtureEvent(
+        fixtureId: fixtureId,
+        eventType: 'exchanged',
+        className: className,
+        teacherName: _auth.currentUser?.email?.split('@')[0] ?? 'Teacher',
+        details: {'toTeacherName': picked['name']!},
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+}
+
+/// Minimal teacher picker for handing off a held fixture to someone else.
+class _TeacherHandoffDialog extends StatelessWidget {
+  final String excludeUid;
+  final String className;
+
+  const _TeacherHandoffDialog({required this.excludeUid, required this.className});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Hand off $className'),
+      content: SizedBox(
+        width: 360,
+        height: 360,
+        child: StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('users')
+              .where('role', isEqualTo: 'teacher')
+              .snapshots(),
+          builder: (context, snapshot) {
+            if (!snapshot.hasData) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final docs = snapshot.data!.docs.where((d) => d.id != excludeUid).toList();
+            if (docs.isEmpty) {
+              return const Center(child: Text('No other teachers found.'));
+            }
+            return ListView.builder(
+              itemCount: docs.length,
+              itemBuilder: (context, i) {
+                final data = docs[i].data() as Map<String, dynamic>;
+                final name = data['name']?.toString() ?? data['email']?.toString() ?? 'Teacher';
+                return ListTile(
+                  leading: const Icon(Icons.person_outline),
+                  title: Text(name),
+                  onTap: () => Navigator.pop(context, {'uid': docs[i].id, 'name': name}),
+                );
+              },
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+      ],
+    );
   }
 }
 

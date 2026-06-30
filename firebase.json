@@ -1,1 +1,38 @@
-{"flutter":{"platforms":{"dart":{"lib/firebase_options.dart":{"projectId":"akespsfm","configurations":{"android":"1:66271824789:android:550d04c517824a7aec049c","ios":"1:66271824789:ios:e7c357160d2ba07fec049c","web":"1:66271824789:web:85ccd3390abc065bec049c"}}},"android":{"default":{"projectId":"akespsfm","appId":"1:66271824789:android:550d04c517824a7aec049c","fileOutput":"android/app/google-services.json"}}}}}
+{
+  "flutter": {
+    "platforms": {
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "akespsfm",
+          "configurations": {
+            "android": "1:66271824789:android:550d04c517824a7aec049c",
+            "ios": "1:66271824789:ios:e7c357160d2ba07fec049c",
+            "web": "1:66271824789:web:85ccd3390abc065bec049c"
+          }
+        }
+      },
+      "android": {
+        "default": {
+          "projectId": "akespsfm",
+          "appId": "1:66271824789:android:550d04c517824a7aec049c",
+          "fileOutput": "android/app/google-services.json"
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log"
+      ]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}

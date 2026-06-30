@@ -188,6 +188,12 @@ class NotificationService {
         'data': data ?? {},
         'timestamp': FieldValue.serverTimestamp(),
         'read': false,
+        // Who actually triggered this, verified server-side by Firestore
+        // rules (must equal request.auth.uid) — without this, any signed-in
+        // client could create a notification addressed to anyone with any
+        // title/body, impersonating e.g. an admin's "leave approved"
+        // message to mislead or harass another teacher.
+        'senderId': _auth.currentUser?.uid ?? '',
       });
 
       // Only pop a live OS notification when it's actually for the person
@@ -228,6 +234,7 @@ class NotificationService {
           'data': data ?? {},
           'timestamp': FieldValue.serverTimestamp(),
           'read': false,
+          'senderId': _auth.currentUser?.uid ?? '',
         });
       }
 
