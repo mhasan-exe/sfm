@@ -188,22 +188,56 @@ class _AdminTimetablePageState extends State<AdminTimetablePage> {
         },
       );
 
-      final outcome = await _timetable.generateAndApplyClassTimetable(
-        classId: widget.classId,
-      );
-
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          duration: const Duration(seconds: 5),
-          content: Text(
-            'Quotas saved. Generated ${outcome.assigned}/${outcome.total} slots.'
-            '${outcome.warnings.isNotEmpty ? ' ${outcome.warnings.length} warning(s).' : ''}',
-          ),
+        const SnackBar(
+          duration: Duration(seconds: 4),
+          content: Text('Quotas saved. Existing timetable left untouched.'),
         ),
       );
 
       setState(() => _showQuotaConfigure = false);
+
+      // Saving the config used to ALWAYS regenerate the whole weekly
+      // timetable immediately afterwards, silently overwriting any manual
+      // drag-and-drop assignments the admin had made. Generation is now a
+      // separate, explicitly-confirmed action — use the "Generate" button,
+      // or confirm here if you actually want to regenerate right now.
+      final regenerateNow = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Regenerate timetable now?'),
+          content: const Text(
+            'Quotas are saved. Regenerating will overwrite the current weekly '
+            'timetable for this class, including any manual assignments. '
+            'You can also do this later from the Generate button.',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Not now')),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Regenerate'),
+            ),
+          ],
+        ),
+      );
+
+      if (regenerateNow == true && mounted) {
+        final outcome = await _timetable.generateAndApplyClassTimetable(
+          classId: widget.classId,
+        );
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            duration: const Duration(seconds: 5),
+            content: Text(
+              'Generated ${outcome.assigned}/${outcome.total} slots.'
+              '${outcome.warnings.isNotEmpty ? ' ${outcome.warnings.length} warning(s).' : ''}',
+            ),
+          ),
+        );
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1107,22 +1141,30 @@ class _EmptySlotCell extends StatelessWidget {
       }
 
       if (!outcome.assigned && outcome.quotaExceeded && context.mounted) {
-        final confirmed = await showDialog<bool>(
+        final choice = await showDialog<String>(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Exceeds quota'),
-            content: Text('${outcome.warnings.join('\n')}\n\nAssign anyway?'),
+            content: Text('${outcome.warnings.join('\n')}\n\nHow do you want to proceed?'),
             actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              TextButton(onPressed: () => Navigator.pop(ctx, 'cancel'), child: const Text('Cancel')),
+              if (outcome.conflictingSlotId != null)
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, 'remove_other'),
+                  child: const Text('Remove other & assign'),
+                ),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
-                onPressed: () => Navigator.pop(ctx, true),
+                onPressed: () => Navigator.pop(ctx, 'assign_anyway'),
                 child: const Text('Assign anyway'),
               ),
             ],
           ),
         );
-        if (confirmed == true && context.mounted) {
+        if (choice == 'remove_other' && outcome.conflictingSlotId != null && context.mounted) {
+          await TimetableService().clearSlotAssignment(outcome.conflictingSlotId!);
+          await _performAssign(context, draggedTeacherId);
+        } else if (choice == 'assign_anyway' && context.mounted) {
           await _performAssign(context, draggedTeacherId, overrideQuota: true);
         }
         return;
@@ -1290,22 +1332,30 @@ class _SlotCellState extends State<_SlotCell> {
       }
 
       if (!outcome.assigned && outcome.quotaExceeded && mounted) {
-        final confirmed = await showDialog<bool>(
+        final choice = await showDialog<String>(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Exceeds quota'),
-            content: Text('${outcome.warnings.join('\n')}\n\nAssign anyway?'),
+            content: Text('${outcome.warnings.join('\n')}\n\nHow do you want to proceed?'),
             actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              TextButton(onPressed: () => Navigator.pop(ctx, 'cancel'), child: const Text('Cancel')),
+              if (outcome.conflictingSlotId != null)
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, 'remove_other'),
+                  child: const Text('Remove other & assign'),
+                ),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
-                onPressed: () => Navigator.pop(ctx, true),
+                onPressed: () => Navigator.pop(ctx, 'assign_anyway'),
                 child: const Text('Assign anyway'),
               ),
             ],
           ),
         );
-        if (confirmed == true) {
+        if (choice == 'remove_other' && outcome.conflictingSlotId != null) {
+          await TimetableService().clearSlotAssignment(outcome.conflictingSlotId!);
+          await _performAssign(draggedTeacherId);
+        } else if (choice == 'assign_anyway') {
           await _performAssign(draggedTeacherId, overrideQuota: true);
         }
         return;
@@ -1531,6 +1581,49 @@ class _SlotEditSheetState extends State<_SlotEditSheet> {
     Navigator.of(context).pop();
   }
 
+  Future<void> _clearSlot(BuildContext context) async {
+    final teacherName = widget.slot.teacherName;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove teacher from this slot?'),
+        content: Text(
+          'This clears ${teacherName.isEmpty ? 'the teacher' : teacherName} from '
+          '${widget.slot.day} · Unit ${widget.slot.unit} only — every other slot for '
+          'them stays exactly as it is.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    final weeklySlotId = _teacherService.slotId(
+      widget.classId,
+      widget.slot.day,
+      widget.slot.unit,
+    );
+
+    try {
+      await _teacherService.clearSlotAssignment(weeklySlotId);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not clear slot: $e')),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    Navigator.of(context).pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     final empty = widget.slot.teacherName.trim().isEmpty;
@@ -1604,6 +1697,18 @@ class _SlotEditSheetState extends State<_SlotEditSheet> {
                 label: const Text('Assign teacher'),
               ),
             ),
+            if (!empty) ...[
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(foregroundColor: Colors.redAccent),
+                  onPressed: () => _clearSlot(context),
+                  icon: const Icon(Icons.person_remove_alt_1_outlined),
+                  label: const Text('Remove teacher from this slot'),
+                ),
+              ),
+            ],
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('Cancel'),

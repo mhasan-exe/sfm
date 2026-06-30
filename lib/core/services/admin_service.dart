@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 class AdminService {
@@ -34,5 +35,23 @@ class AdminService {
 
   Future<void> deleteAdmin(String docId) async {
     await _admins.doc(docId).delete();
+  }
+
+  // ---------------------------------------------------------------------
+  // Teacher re-sync — pulls every Firebase Auth account and creates a
+  // `users/{uid}` doc for any that don't already have one. Handles the
+  // case where someone authenticated successfully (so they show up in the
+  // Firebase Auth console) but never opened the app far enough for
+  // `UserService.createUserIfNotExists()` to run, so no Firestore profile
+  // ever got created for them.
+  //
+  // Must go through a Cloud Function — the client SDK can only see the
+  // CURRENTLY signed-in user, never the full list of Auth accounts; that
+  // requires the Admin SDK (server-side only). See functions/resyncTeachers.js.
+  // ---------------------------------------------------------------------
+  Future<Map<String, dynamic>> resyncTeachersFromAuth() async {
+    final callable = FirebaseFunctions.instance.httpsCallable('resyncTeachers');
+    final result = await callable.call();
+    return Map<String, dynamic>.from(result.data as Map);
   }
 }

@@ -25,12 +25,22 @@ class ClashAssignmentOutcome {
   /// true`) may override this, with a warning.
   final bool firstUnitConflict;
 
+  /// When [assigned] is false because of [quotaExceeded] or because the
+  /// dragged teacher already teaches this class on the same day at a
+  /// different unit (the "1 unit/day per class" rule), this is the slot id
+  /// of that OTHER existing assignment. The UI uses this to offer a
+  /// "Remove other & assign" option that clears that slot instead of just
+  /// Cancel / Assign anyway. Null when there's no single other slot to
+  /// point at (e.g. school-wide weekly cap exceeded across many classes).
+  final String? conflictingSlotId;
+
   const ClashAssignmentOutcome({
     required this.assigned,
     required this.warnings,
     this.quotaExceeded = false,
     this.leaveConflict = false,
     this.firstUnitConflict = false,
+    this.conflictingSlotId,
   });
 }
 

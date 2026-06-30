@@ -73,6 +73,45 @@ class UserService {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Delete teacher — removes the Firestore profile AND cleans up every
+  // place that referenced them, so deleting a teacher doesn't leave ghost
+  // entries in class "units" config or stale assignments on the live
+  // timetable.
+  //
+  // NOTE: this only deletes the Firestore `users/{uid}` doc. It does NOT
+  // delete the underlying Firebase Auth account — that requires the Admin
+  // SDK and can't be done from the client. If the same person signs back
+  // in, `createUserIfNotExists()` will silently recreate their profile. To
+  // permanently block them, also delete/disable the Auth account via a
+  // Cloud Function (see the resyncTeachers function for the pattern), or
+  // remove them from the @akesp.net allow-list.
+  // ---------------------------------------------------------------------
+  Future<void> deleteTeacher(String uid) async {
+    // 1. Remove from every class's teachers[] array so the per-class
+    // "units" config doesn't keep pointing at a deleted teacher.
+    final classesSnap = await firestore.collection('classes').get();
+    for (final doc in classesSnap.docs) {
+      final teachers = (doc.data()['teachers'] as List?) ?? [];
+      final hasTeacher = teachers.any((t) => (t as Map)['teacherId'] == uid);
+      if (hasTeacher) {
+        final updated = teachers.where((t) => (t as Map)['teacherId'] != uid).toList();
+        await doc.reference.update({'teachers': updated});
+      }
+    }
+
+    // 2. Clear any weekly_timetables slots still assigned to them so the
+    // timetable doesn't keep showing a deleted teacher's name.
+    final slotsSnap =
+        await firestore.collection('weekly_timetables').where('teacherId', isEqualTo: uid).get();
+    for (final s in slotsSnap.docs) {
+      await s.reference.update({'teacherId': '', 'teacherName': ''});
+    }
+
+    // 3. Finally delete the profile itself.
+    await _users.doc(uid).delete();
+  }
+
   // Stream all teachers
   Stream<List<UserModel>> watchTeachers() {
     return _users

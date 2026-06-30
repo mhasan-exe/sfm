@@ -5,13 +5,56 @@ import '../../core/widgets/glass_card.dart';
 import '../../core/theme/app_theme.dart';
 
 import '../../core/services/admin_config_service.dart';
+import '../../core/services/admin_service.dart';
 import '../../core/services/user_service.dart';
 
 import '../../models/user_model.dart';
 import '../timetable/teacher_timetable_screen.dart';
 
-class ProfilesScreen extends StatelessWidget {
+class ProfilesScreen extends StatefulWidget {
   const ProfilesScreen({super.key});
+
+  @override
+  State<ProfilesScreen> createState() => _ProfilesScreenState();
+}
+
+class _ProfilesScreenState extends State<ProfilesScreen> {
+  bool _isAdmin = false;
+  bool _resyncing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    AdminService().isAdmin().then((value) {
+      if (mounted) setState(() => _isAdmin = value);
+    });
+  }
+
+  Future<void> _resyncTeachers() async {
+    setState(() => _resyncing = true);
+    try {
+      final result = await AdminService().resyncTeachersFromAuth();
+      final created = result['created'] ?? 0;
+      final total = result['totalAuthUsers'] ?? 0;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            created > 0
+                ? 'Re-sync complete: created $created missing profile(s) out of $total Auth account(s).'
+                : 'Re-sync complete: every Auth account ($total) already has a profile.',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Re-sync failed: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _resyncing = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -41,6 +84,21 @@ class ProfilesScreen extends StatelessWidget {
                         textAlign: TextAlign.center,
                         style: TextStyle(color: Colors.white.withValues(alpha: 0.6), fontSize: 12),
                       ),
+                      // If this shows "permission-denied", the signed-in account's
+                      // email isn't covered by the @akesp.net allow-list in
+                      // Firestore rules' isAllowedDomain() — that's the rules
+                      // doing their job, not a bug in this screen.
+                      if (_isAdmin) ...[
+                        const SizedBox(height: 16),
+                        OutlinedButton.icon(
+                          onPressed: _resyncing ? null : _resyncTeachers,
+                          icon: _resyncing
+                              ? const SizedBox(
+                                  width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.sync),
+                          label: const Text('Re-sync teachers from Auth'),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -54,7 +112,24 @@ class ProfilesScreen extends StatelessWidget {
             final teachers = snapshot.data!;
 
             if (teachers.isEmpty) {
-              return const Center(child: Text('No Teachers Found'));
+              return Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('No Teachers Found'),
+                    if (_isAdmin) ...[
+                      const SizedBox(height: 12),
+                      OutlinedButton.icon(
+                        onPressed: _resyncing ? null : _resyncTeachers,
+                        icon: _resyncing
+                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.sync),
+                        label: const Text('Re-sync teachers from Auth'),
+                      ),
+                    ],
+                  ],
+                ),
+              );
             }
 
             // Live, computed-from-weekly_timetables permanent unit count
@@ -74,30 +149,52 @@ class ProfilesScreen extends StatelessWidget {
                     final isWide = constraints.maxWidth > 900;
                     final crossAxisCount = isWide ? 3 : 1;
 
-                    return GridView.builder(
-                      padding: AppTheme.pagePadding(context),
-                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: crossAxisCount,
-                        crossAxisSpacing: 16,
-                        mainAxisSpacing: 16,
-                        // A fixed, generous height instead of an aspect ratio: the
-                        // card's content (avatar row + two stat chips + a progress
-                        // bar + two action buttons) doesn't scale with width, so a
-                        // ratio-based height was overflowing on narrower phones.
-                        mainAxisExtent: 268,
-                      ),
-                      itemCount: teachers.length,
-                      itemBuilder: (context, index) {
-                        final teacher = teachers[index];
-                        return _TeacherCard(
-                          teacher: teacher,
-                          maxUnits: maxUnits,
-                          livePermanentUnits: liveUnits[teacher.uid] ?? 0,
-                        )
-                            .animate()
-                            .fadeIn(duration: 400.ms)
-                            .slideY(begin: 0.1);
-                      },
+                    return Column(
+                      children: [
+                        if (_isAdmin)
+                          Padding(
+                            padding: EdgeInsets.fromLTRB(
+                                AppTheme.pagePadding(context).horizontal / 2, 12, AppTheme.pagePadding(context).horizontal / 2, 0),
+                            child: Align(
+                              alignment: Alignment.centerRight,
+                              child: TextButton.icon(
+                                onPressed: _resyncing ? null : _resyncTeachers,
+                                icon: _resyncing
+                                    ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                                    : const Icon(Icons.sync, size: 18),
+                                label: const Text('Re-sync from Auth'),
+                              ),
+                            ),
+                          ),
+                        Expanded(
+                          child: GridView.builder(
+                            padding: AppTheme.pagePadding(context),
+                            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: crossAxisCount,
+                              crossAxisSpacing: 16,
+                              mainAxisSpacing: 16,
+                              // A fixed, generous height instead of an aspect ratio: the
+                              // card's content (avatar row + two stat chips + a progress
+                              // bar + two action buttons) doesn't scale with width, so a
+                              // ratio-based height was overflowing on narrower phones.
+                              mainAxisExtent: 268,
+                            ),
+                            itemCount: teachers.length,
+                            itemBuilder: (context, index) {
+                              final teacher = teachers[index];
+                              return _TeacherCard(
+                                teacher: teacher,
+                                maxUnits: maxUnits,
+                                livePermanentUnits: liveUnits[teacher.uid] ?? 0,
+                                isAdmin: _isAdmin,
+                              )
+                                  .animate()
+                                  .fadeIn(duration: 400.ms)
+                                  .slideY(begin: 0.1);
+                            },
+                          ),
+                        ),
+                      ],
                     );
                   },
                 );
@@ -114,12 +211,50 @@ class _TeacherCard extends StatelessWidget {
   final UserModel teacher;
   final int maxUnits;
   final int livePermanentUnits;
+  final bool isAdmin;
 
   const _TeacherCard({
     required this.teacher,
     required this.maxUnits,
     required this.livePermanentUnits,
+    this.isAdmin = false,
   });
+
+  Future<void> _deleteTeacher(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete teacher?'),
+        content: Text(
+          'This removes ${teacher.name}\'s profile, takes them off every class\'s '
+          'unit config, and clears any timetable slots assigned to them. '
+          'This does NOT delete their sign-in account — if they sign in again, '
+          'a fresh blank profile will be created automatically.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await AdminService().deleteTeacher(teacher.uid);
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${teacher.name} deleted.')),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to delete: $e')),
+      );
+    }
+  }
 
   void _openTimetable(BuildContext context) {
     Navigator.of(context).push(
@@ -237,10 +372,16 @@ class _TeacherCard extends StatelessWidget {
                   onSelected: (value) {
                     if (value == 'timetable') _openTimetable(context);
                     if (value == 'profile') _showProfileSheet(context);
+                    if (value == 'delete') _deleteTeacher(context);
                   },
-                  itemBuilder: (_) => const [
-                    PopupMenuItem(value: 'timetable', child: Text('Open Timetable')),
-                    PopupMenuItem(value: 'profile', child: Text('View Profile')),
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(value: 'timetable', child: Text('Open Timetable')),
+                    const PopupMenuItem(value: 'profile', child: Text('View Profile')),
+                    if (isAdmin)
+                      const PopupMenuItem(
+                        value: 'delete',
+                        child: Text('Delete Teacher', style: TextStyle(color: Colors.redAccent)),
+                      ),
                   ],
                 ),
               ],

@@ -601,3 +601,174 @@ exports.triggerAutoAssign = onCall(async (request) => {
   );
   return { ok: true };
 });
+
+// ---------------------------------------------------------------------------
+// resyncTeachers — pulls the full Firebase Auth user list (Admin SDK only;
+// the client SDK can only ever see the currently signed-in user) and
+// creates a `users/{uid}` doc for any account that authenticated but never
+// got a Firestore profile written for it (closed the app before
+// UserService.createUserIfNotExists ran, signed in directly against Auth
+// outside the app flow, etc).
+// ---------------------------------------------------------------------------
+exports.resyncTeachers = onCall(async (request) => {
+  await requireAdmin(request);
+
+  let created = 0;
+  let totalAuthUsers = 0;
+  let nextPageToken;
+
+  do {
+    const listResult = await admin.auth().listUsers(1000, nextPageToken);
+    nextPageToken = listResult.pageToken;
+    totalAuthUsers += listResult.users.length;
+
+    let batch = h.db().batch();
+    let inBatch = 0;
+
+    for (const u of listResult.users) {
+      const ref = h.db().collection("users").doc(u.uid);
+      const snap = await ref.get();
+      if (snap.exists) continue;
+
+      batch.set(ref, {
+        uid: u.uid,
+        name: u.displayName || "",
+        email: u.email || "",
+        role: "teacher",
+        isAdmin: false,
+        defaultUnits: 0,
+        fixtureUnits: 0,
+        photoUrl: u.photoURL || null,
+        bio: "",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        resyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      created++;
+      inBatch++;
+
+      // Firestore batches cap at 500 writes; chunk defensively.
+      if (inBatch >= 450) {
+        await batch.commit();
+        batch = h.db().batch();
+        inBatch = 0;
+      }
+    }
+
+    if (inBatch > 0) {
+      await batch.commit();
+    }
+  } while (nextPageToken);
+
+  return { created, totalAuthUsers };
+});
+
+// ---------------------------------------------------------------------------
+// deleteTeacher — admin-only. Removes the teacher's Firestore profile AND
+// cleans up every place that referenced them (per-class `teachers[]` unit
+// config, any weekly_timetables slot still assigned to them), so deleting a
+// teacher doesn't leave ghost entries behind. Runs server-side (rather than
+// as several separate client writes) so the cleanup is atomic-ish and can't
+// be partially skipped by a client that only has rules-permitted access to
+// some of these collections.
+//
+// NOTE: this does NOT delete the underlying Firebase Auth account. If the
+// same person signs back in, createUserIfNotExists() will recreate a blank
+// profile for them. Pass `alsoDeleteAuthAccount: true` to also remove their
+// ability to sign in again.
+// ---------------------------------------------------------------------------
+exports.deleteTeacher = onCall(async (request) => {
+  await requireAdmin(request);
+  const { teacherId, alsoDeleteAuthAccount } = request.data || {};
+  if (!teacherId) {
+    throw new HttpsError("invalid-argument", "teacherId is required.");
+  }
+
+  // 1. Remove from every class's teachers[] array.
+  const classesSnap = await h.db().collection("classes").get();
+  for (const doc of classesSnap.docs) {
+    const teachers = doc.data().teachers || [];
+    if (teachers.some((t) => t.teacherId === teacherId)) {
+      const updated = teachers.filter((t) => t.teacherId !== teacherId);
+      await doc.ref.update({ teachers: updated });
+    }
+  }
+
+  // 2. Clear any weekly_timetables slots still pointing at them.
+  const slotsSnap = await h
+    .db()
+    .collection("weekly_timetables")
+    .where("teacherId", "==", teacherId)
+    .get();
+  const slotsBatch = h.db().batch();
+  for (const d of slotsSnap.docs) {
+    slotsBatch.update(d.ref, { teacherId: "", teacherName: "" });
+  }
+  if (!slotsSnap.empty) {
+    await slotsBatch.commit();
+  }
+
+  // 3. Delete the profile itself.
+  await h.db().collection("users").doc(teacherId).delete();
+
+  // 4. Optionally remove their ability to sign in again.
+  let authAccountDeleted = false;
+  if (alsoDeleteAuthAccount) {
+    try {
+      await admin.auth().deleteUser(teacherId);
+      authAccountDeleted = true;
+    } catch (e) {
+      // Don't fail the whole call if the Auth account is already gone or
+      // otherwise can't be removed — the Firestore cleanup above already
+      // succeeded and is the more important part.
+    }
+  }
+
+  return { ok: true, authAccountDeleted };
+});
+
+// ---------------------------------------------------------------------------
+// clearTimetableSlot — admin-only. Removes the assigned teacher from a
+// single weekly_timetables slot, leaving everything else about the slot
+// (day/unit/startTime/endTime/classId) untouched. This is the server-side
+// counterpart of the admin timetable grid's "Clear slot / remove teacher"
+// popup menu option, scoped to exactly one slot — it does NOT touch any
+// other slot for that teacher.
+// ---------------------------------------------------------------------------
+exports.clearTimetableSlot = onCall(async (request) => {
+  await requireAdmin(request);
+  const { slotId } = request.data || {};
+  if (!slotId) {
+    throw new HttpsError("invalid-argument", "slotId is required.");
+  }
+
+  const ref = h.db().collection("weekly_timetables").doc(slotId);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    throw new HttpsError("not-found", "Slot not found.");
+  }
+  const previousTeacherId = snap.data().teacherId || "";
+
+  await ref.set(
+    {
+      teacherId: "",
+      teacherName: "",
+      originalTeacherId: "",
+      type: "permanent",
+      clearedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  if (previousTeacherId) {
+    await notifyTeacher(
+      previousTeacherId,
+      "Timetable updated",
+      "You were removed from a slot on your weekly timetable.",
+      "classOccurring",
+      { slotId }
+    );
+  }
+
+  return { ok: true, previousTeacherId };
+});
+

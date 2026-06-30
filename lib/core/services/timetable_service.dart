@@ -283,6 +283,32 @@ class TimetableService {
       assignTeacher(
           slotId: slotId, teacherId: teacherId, teacherName: teacherName);
 
+  /// Clears a slot's teacher assignment without touching anything else.
+  /// Used by the "Remove other & assign" dialog option: when a teacher
+  /// would exceed quota / their 1-unit/day limit because of one specific
+  /// OTHER slot they're already in, this frees that slot up first so the
+  /// new assignment can go through cleanly instead of needing an override.
+  Future<void> clearSlotAssignment(String slotId) async {
+    final before = await _weekly.doc(slotId).get();
+    final previousTeacherId = (before.data()?['teacherId'] as String?) ?? '';
+
+    await _weekly.doc(slotId).set({
+      'teacherId': '',
+      'teacherName': '',
+      'originalTeacherId': '',
+      'type': 'permanent',
+      'clearedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+
+    try {
+      await _reconcileStaleCoverForSlot(slotId);
+    } catch (_) {}
+
+    if (previousTeacherId.isNotEmpty) {
+      await _afterWeeklyAssignmentChanged([previousTeacherId]);
+    }
+  }
+
   Future<void> clearSlot(String slotId) async {
     await _weekly.doc(slotId).set({
       'teacherId': '',
@@ -522,6 +548,30 @@ class TimetableService {
         assigned: false,
         warnings: [quotaWarning],
         quotaExceeded: allowOverride,
+        // If the quota overflow is caused by this same teacher already
+        // sitting in another unit of this class today, surface that slot
+        // so the UI can offer "Remove other & assign" instead of just
+        // Cancel / Assign anyway.
+        conflictingSlotId: sameClassSameDayOther.isNotEmpty
+            ? sameClassSameDayOther.first['id'] as String
+            : null,
+      );
+    }
+
+    // Soft "1 unit/day per class" rule: same teacher already teaches this
+    // class today at a different unit. Not a hard time clash, but treated
+    // as a real conflict the admin must explicitly resolve — either by
+    // assigning anyway (now allowed twice in one day) or by clearing the
+    // other unit first so the teacher stays at one unit/day.
+    if (sameClassSameDayOther.isNotEmpty && !overrideQuota) {
+      final otherSlotId = sameClassSameDayOther.first['id'] as String;
+      return ClashAssignmentOutcome(
+        assigned: false,
+        warnings: [
+          '${draggedTeacherName.isEmpty ? draggedTeacherId : draggedTeacherName} already teaches this class on $destDay at another unit.',
+        ],
+        quotaExceeded: true,
+        conflictingSlotId: otherSlotId,
       );
     }
 
