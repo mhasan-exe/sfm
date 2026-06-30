@@ -54,4 +54,34 @@ class AdminService {
     final result = await callable.call();
     return Map<String, dynamic>.from(result.data as Map);
   }
+
+  // ---------------------------------------------------------------------
+  // deleteTeacher — runs server-side (Admin SDK) so the profile delete,
+  // the per-class teachers[] cleanup, and the weekly_timetables cleanup
+  // all happen together rather than as several separate client writes that
+  // could partially fail. Set [alsoDeleteAuthAccount] to also revoke their
+  // ability to sign back in.
+  // ---------------------------------------------------------------------
+  Future<Map<String, dynamic>> deleteTeacher(
+    String teacherId, {
+    bool alsoDeleteAuthAccount = false,
+  }) async {
+    final callable = FirebaseFunctions.instance.httpsCallable('deleteTeacher');
+    final result = await callable.call({
+      'teacherId': teacherId,
+      'alsoDeleteAuthAccount': alsoDeleteAuthAccount,
+    });
+    return Map<String, dynamic>.from(result.data as Map);
+  }
+
+  // ---------------------------------------------------------------------
+  // clearTimetableSlot — removes the assigned teacher from exactly ONE
+  // weekly_timetables slot (day/unit/class), leaving every other slot for
+  // that teacher untouched. Backs the admin timetable grid's "Clear slot /
+  // Remove teacher" popup option.
+  // ---------------------------------------------------------------------
+  Future<void> clearTimetableSlot(String slotId) async {
+    final callable = FirebaseFunctions.instance.httpsCallable('clearTimetableSlot');
+    await callable.call({'slotId': slotId});
+  }
 }
