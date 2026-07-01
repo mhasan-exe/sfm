@@ -8,7 +8,7 @@ class AuthService {
   bool isAllowedEmail(String email) {
     email = email.toLowerCase();
 
-    return email.endsWith('@akesp.net') ||
+    return email.endsWith('akesp.net') ||
         email == '2817783@students.akesp.net';
   }
 
