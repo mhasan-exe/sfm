@@ -2,6 +2,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/services/admin_service.dart';
+import '../../core/services/user_service.dart';
 import 'login_screen.dart';
 import '../../core/widgets/app_background.dart';
 
@@ -19,6 +20,7 @@ class AuthGate extends StatefulWidget {
 
 class _AuthGateState extends State<AuthGate> {
   final adminService = AdminService();
+  final userService = UserService();
   bool _hasSeededAdmin = false;
 
   static const _seedAdminEmail = '2817783@students.akesp.net';
@@ -34,6 +36,20 @@ class _AuthGateState extends State<AuthGate> {
       );
       _hasSeededAdmin = true;
     }
+  }
+
+  // Belt-and-suspenders: also enforced from AuthService.signInWithGoogle()
+  // right after a fresh sign-in, but re-checking here on EVERY auth-state
+  // change (cold start with an already-signed-in session, app resume,
+  // token refresh, etc) catches the case where a previous creation attempt
+  // never completed (closed the app mid-flow, was offline, etc) without
+  // requiring the person to sign out and back in. createUserIfNotExists()
+  // is cheap and safe to call repeatedly — see its doc comment in
+  // UserService for the concurrent-login queueing/retry behavior.
+  void _ensureUserProfile(User user) {
+    // Fire-and-forget: this screen shouldn't block on it, and
+    // UserService already retries internally on transient failure.
+    userService.createUserIfNotExists();
   }
 
   @override
@@ -59,6 +75,7 @@ class _AuthGateState extends State<AuthGate> {
               () => _seedAdminIfNeeded(user),
             );
           }
+          _ensureUserProfile(user);
           return AppBackground(child: widget.child);
 
         }

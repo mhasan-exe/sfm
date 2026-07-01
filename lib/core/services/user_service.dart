@@ -12,28 +12,85 @@ class UserService {
   CollectionReference<Map<String, dynamic>> get _users =>
       firestore.collection('users');
 
-  // Create user if not exists
+  // ---------------------------------------------------------------------
+  // Create user if not exists — hardened against concurrent logins.
+  //
+  // THE BUG this replaces: the old version did a plain `get()` then a
+  // plain `set()`. If two logins for a brand-new account land close
+  // together (two devices, a flaky reconnect that retries the sign-in
+  // flow, AuthGate's own admin-seed check firing alongside the login
+  // screen's call, etc), both could read "doesn't exist" before either
+  // write lands. Firestore then evaluates whichever `set()` arrives
+  // second, after the doc already exists, as an UPDATE rather than a
+  // CREATE — and `firestore.rules`' `selfEditableUserFields()` only
+  // allows a self-update to touch name/bio/photoUrl/fixtureUnits, not the
+  // full profile (role, isAdmin, defaultUnits, email) a fresh-account
+  // write contains. That mismatch is what surfaced as "user creation
+  // fails" under concurrent logins.
+  //
+  // THE FIX, two layers:
+  //  1. In-process queue: concurrent calls for the SAME uid within this
+  //     app instance (e.g. AuthGate's admin-seed check and the login
+  //     screen both triggering this around the same moment) share one
+  //     in-flight Future instead of racing separate reads/writes.
+  //  2. Firestore transaction: the actual existence-check-then-create
+  //     happens inside a transaction, so if a genuinely separate login
+  //     (a different device/session) wins the race, this transaction is
+  //     told to retry by Firestore, re-reads, sees the doc now exists,
+  //     and safely no-ops instead of attempting a conflicting write.
+  // Safe and cheap to call on every login attempt and on every app
+  // start/resume while signed in — retries with backoff on transient
+  // failures (e.g. a flaky connection) rather than silently giving up
+  // after one attempt.
+  // ---------------------------------------------------------------------
+  static final Map<String, Future<void>> _pendingCreates = {};
+
   Future<void> createUserIfNotExists() async {
     final user = auth.currentUser;
-
     if (user == null) return;
 
-    final doc = await _users.doc(user.uid).get();
+    final existing = _pendingCreates[user.uid];
+    if (existing != null) {
+      await existing;
+      return;
+    }
 
-    if (!doc.exists) {
-      final userModel = UserModel(
-        uid: user.uid,
-        name: user.displayName ?? '',
-        email: user.email ?? '',
-        role: 'teacher',
-        isAdmin: false,
-        defaultUnits: 0,
-        fixtureUnits: 0,
-        photoUrl: user.photoURL,
-        bio: '',
-      );
+    final future = _createUserIfNotExistsWithRetry(user);
+    _pendingCreates[user.uid] = future;
+    try {
+      await future;
+    } finally {
+      _pendingCreates.remove(user.uid);
+    }
+  }
 
-      await _users.doc(user.uid).set(userModel.toMap());
+  Future<void> _createUserIfNotExistsWithRetry(User user) async {
+    const maxAttempts = 3;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await firestore.runTransaction((tx) async {
+          final ref = _users.doc(user.uid);
+          final snap = await tx.get(ref);
+          if (snap.exists) return; // another concurrent login already created it
+
+          final userModel = UserModel(
+            uid: user.uid,
+            name: user.displayName ?? '',
+            email: user.email ?? '',
+            role: 'teacher',
+            isAdmin: false,
+            defaultUnits: 0,
+            fixtureUnits: 0,
+            photoUrl: user.photoURL,
+            bio: '',
+          );
+          tx.set(ref, userModel.toMap());
+        });
+        return;
+      } catch (_) {
+        if (attempt == maxAttempts) rethrow;
+        await Future.delayed(Duration(milliseconds: 300 * attempt));
+      }
     }
   }
 

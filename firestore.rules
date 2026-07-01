@@ -89,10 +89,38 @@ service cloud.firestore {
             request.resource.data.fixtureUnits - resource.data.fixtureUnits == -1)));
     }
 
+    // ---------------------------------------------------------------
+    // fixtureUnitsStepOnly — REVERSAL NOTE: claim/release/assign/exchange/
+    // expiry-sweep used to run through Cloud Functions specifically
+    // because several of those flows adjust a DIFFERENT teacher's
+    // fixtureUnits than whoever's session triggered the action (releasing
+    // on someone's behalf, the expiry sweep, auto-assign, exchanging a
+    // fixture to a named recipient) — a security rule can't verify "this
+    // write to someone else's doc is legitimate because it's paired with
+    // that other write in the same client transaction" the way trusted
+    // server code could. Now that this logic runs on the client again,
+    // this rule is the necessary (and knowingly weaker) replacement: ANY
+    // signed-in user may bump ANY other user's fixtureUnits by exactly
+    // one step in either direction, never below zero. It does NOT verify
+    // the step corresponds to a real, legitimate fixture transaction — a
+    // malicious or buggy client could spam another teacher's
+    // fixtureUnits up/down one at a time. Accepted tradeoff of the
+    // decision to move this logic back to the client.
+    // ---------------------------------------------------------------
+    function fixtureUnitsStepOnly() {
+      let affected = request.resource.data.diff(resource.data).affectedKeys();
+      return affected.hasOnly(['fixtureUnits']) &&
+        request.resource.data.fixtureUnits >= 0 &&
+        (request.resource.data.fixtureUnits - resource.data.fixtureUnits == 1 ||
+         request.resource.data.fixtureUnits - resource.data.fixtureUnits == -1);
+    }
+
     match /users/{userId} {
       allow read: if isSignedIn();
       allow create: if isOwner(userId);
-      allow update: if isAdmin() || (isOwner(userId) && selfEditableUserFields());
+      allow update: if isAdmin() ||
+        (isOwner(userId) && selfEditableUserFields()) ||
+        (isSignedIn() && fixtureUnitsStepOnly());
       allow delete: if isAdmin();
     }
 
