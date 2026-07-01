@@ -102,11 +102,21 @@ class TimeProfileModel {
 
   final List<TimePeriod> periods;
 
+  /// Optional Friday-specific override rows. Empty means "no override —
+  /// Friday uses [periods] like every other day" (the default). When set,
+  /// this completely replaces [periods] for Friday only; every other day
+  /// keeps using [periods] untouched.
+  final List<TimePeriod> fridayPeriods;
+
   TimeProfileModel({
     required this.id,
     required this.name,
     required this.periods,
+    this.fridayPeriods = const [],
   });
+
+  /// True when Friday has its own custom periods set on this profile.
+  bool get hasCustomFriday => fridayPeriods.isNotEmpty;
 
   /// Teaching periods only, in order — what the timetable grid actually
   /// scaffolds slots for. Breaks are intentionally excluded.
@@ -115,6 +125,20 @@ class TimeProfileModel {
       ..sort((a, b) => a.periodNumber.compareTo(b.periodNumber));
     return list;
   }
+
+  /// Friday's own teaching periods (from [fridayPeriods]), in order.
+  /// Empty when Friday has no override — check [hasCustomFriday] or use
+  /// [teachingPeriodsForDay] instead of calling this directly.
+  List<TimePeriod> get fridayTeachingPeriods {
+    final list = fridayPeriods.where((p) => !p.isBreak).toList()
+      ..sort((a, b) => a.periodNumber.compareTo(b.periodNumber));
+    return list;
+  }
+
+  /// The teaching periods to scaffold for [day] — [fridayTeachingPeriods]
+  /// on Friday when a custom override is set, [teachingPeriods] otherwise.
+  List<TimePeriod> teachingPeriodsForDay(String day) =>
+      (day == 'Friday' && hasCustomFriday) ? fridayTeachingPeriods : teachingPeriods;
 
   List<TimePeriod> get breakPeriods {
     final list = periods.where((p) => p.isBreak).toList()
@@ -145,16 +169,24 @@ class TimeProfileModel {
       'id': id,
       'name': name,
       'periods': periods.map((e) => e.toMap()).toList(),
+      'fridayPeriods': fridayPeriods.map((e) => e.toMap()).toList(),
     };
   }
 
   factory TimeProfileModel.fromMap(Map<String, dynamic> map) {
     final rawPeriods = map['periods'];
+    final rawFridayPeriods = map['fridayPeriods'];
     return TimeProfileModel(
       id: map['id']?.toString() ?? '',
       name: map['name']?.toString() ?? '',
       periods: rawPeriods is List
           ? rawPeriods
+              .whereType<Map>()
+              .map((e) => TimePeriod.fromMap(Map<String, dynamic>.from(e)))
+              .toList()
+          : <TimePeriod>[],
+      fridayPeriods: rawFridayPeriods is List
+          ? rawFridayPeriods
               .whereType<Map>()
               .map((e) => TimePeriod.fromMap(Map<String, dynamic>.from(e)))
               .toList()

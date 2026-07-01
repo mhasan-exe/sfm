@@ -201,22 +201,10 @@ class TimetableService {
     if (cls == null) throw Exception('Class not found');
 
     final profile = await getTimeProfile(cls.timeProfileId);
-    // Only teaching periods become timetable slots — breaks (recess,
-    // lunch, etc) are first-class entries in the Time Profile but are
-    // never assigned a teacher/class.
-    final periods = profile?.teachingPeriods ?? const <TimePeriod>[];
-    if (periods.isEmpty) {
+    if ((profile?.teachingPeriods ?? const <TimePeriod>[]).isEmpty) {
       throw Exception(
           'Time profile "${cls.timeProfileId}" has no teaching periods. Add periods before building the grid.');
     }
-
-    final periodsSorted = [...periods]
-      ..sort((a, b) => a.periodNumber.compareTo(b.periodNumber));
-    final unitCount = cls.unitsPerDay <= 0
-        ? periodsSorted.length
-        : (cls.unitsPerDay < periodsSorted.length
-            ? cls.unitsPerDay
-            : periodsSorted.length);
 
     final existing = await _weekly.where('classId', isEqualTo: classId).get();
     final existingIds = existing.docs.map((d) => d.id).toSet();
@@ -224,6 +212,25 @@ class TimetableService {
     final batch = _firestore.batch();
     var created = 0;
     for (final day in cls.workingDays) {
+      // Only teaching periods become timetable slots — breaks (recess,
+      // lunch, etc) are first-class entries in the Time Profile but are
+      // never assigned a teacher/class. Friday uses the profile's own
+      // Friday override when one is set (see TimeProfileModel.fridayPeriods).
+      final periodsSorted = profile!.teachingPeriodsForDay(day);
+      if (periodsSorted.isEmpty) {
+        throw Exception(
+            'Time profile "${cls.timeProfileId}" has no teaching periods for $day. Add periods before building the grid.');
+      }
+
+      // Friday's custom periods define their own count directly (that's
+      // the whole point of the override); every other day still clamps to
+      // cls.unitsPerDay against the main profile, same as before.
+      final unitCount = (day == 'Friday' && profile.hasCustomFriday)
+          ? periodsSorted.length
+          : (cls.unitsPerDay <= 0
+              ? periodsSorted.length
+              : (cls.unitsPerDay < periodsSorted.length ? cls.unitsPerDay : periodsSorted.length));
+
       for (var i = 0; i < unitCount; i++) {
         final unit = i + 1;
         final id = slotId(classId, day, unit);
@@ -1442,17 +1449,20 @@ class TimetableService {
     await _afterWeeklyAssignmentChanged(touchedTeacherIds);
   }
 
-  Future<void> createTimeProfile({
+  Future<String> createTimeProfile({
     required String name,
     required List periods,
+    List<TimePeriod>? fridayPeriods,
   }) async {
-    await _firestore.collection('time_profiles').add({
+    final ref = await _firestore.collection('time_profiles').add({
       'name': name,
       'periods': periods is List<TimePeriod>
           ? periods.map((p) => p.toMap()).toList()
           : periods,
+      'fridayPeriods': (fridayPeriods ?? const <TimePeriod>[]).map((p) => p.toMap()).toList(),
       'createdAt': FieldValue.serverTimestamp(),
     });
+    return ref.id;
   }
 
   /// Overwrites an existing time profile's name/periods in place. Existing
@@ -1460,14 +1470,27 @@ class TimetableService {
   /// untouched — call [ensureWeeklyScaffold] per class afterwards (or use
   /// the "Resync" action) if classes using this profile should pick up the
   /// new timings/period count.
+  /// Overwrites an existing time profile's name/periods in place. Existing
+  /// timetable slots already scaffolded against the old periods are left
+  /// untouched — call [ensureWeeklyScaffold] per class afterwards (or use
+  /// the "Resync" action) if classes using this profile should pick up the
+  /// new timings/period count.
+  ///
+  /// [fridayPeriods] is optional: pass null to leave whatever Friday
+  /// override currently exists untouched, an empty list to clear a
+  /// previously-set override (Friday goes back to using [periods] like
+  /// every other day), or a populated list to set/replace the override.
   Future<void> updateTimeProfile({
     required String timeProfileId,
     required String name,
     required List<TimePeriod> periods,
+    List<TimePeriod>? fridayPeriods,
   }) async {
     await _firestore.collection('time_profiles').doc(timeProfileId).set({
       'name': name,
       'periods': periods.map((p) => p.toMap()).toList(),
+      if (fridayPeriods != null)
+        'fridayPeriods': fridayPeriods.map((p) => p.toMap()).toList(),
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   }

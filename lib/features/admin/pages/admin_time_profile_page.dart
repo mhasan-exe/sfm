@@ -104,6 +104,7 @@ class _AdminTimeProfilePageState extends State<AdminTimeProfilePage> {
                 _chip(Icons.school_outlined, '${teaching.length} teaching periods'),
                 if (breaks.isNotEmpty) _chip(Icons.free_breakfast_outlined, '${breaks.length} break(s)'),
                 _chip(Icons.schedule_outlined, '${hours.toStringAsFixed(1)}h school day'),
+                if (profile.hasCustomFriday) _chip(Icons.event_outlined, 'Custom Friday hours'),
               ],
             ),
             const SizedBox(height: 10),
@@ -237,6 +238,15 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
   late List<TimePeriod> _rows;
   bool _saving = false;
 
+  /// Optional Friday-only override. Off by default; when the admin first
+  /// turns it on, it's seeded as a COPY of the regular [_rows] ("regular
+  /// timings" as the request specifies) so they're editing a starting
+  /// point rather than a blank slate. Turning it back off before saving
+  /// clears the override — only Friday is ever affected, every other day
+  /// always uses [_rows].
+  bool _customFriday = false;
+  late List<TimePeriod> _fridayRows;
+
   // Quick-generate inputs
   TimeOfDay _genStart = const TimeOfDay(hour: 8, minute: 0);
   TimeOfDay _genEnd = const TimeOfDay(hour: 14, minute: 0);
@@ -252,6 +262,24 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
     _rows = widget.existing != null
         ? widget.existing!.orderedAll.map((p) => p.copyWith()).toList()
         : <TimePeriod>[];
+    _customFriday = widget.existing?.hasCustomFriday ?? false;
+    _fridayRows = widget.existing != null
+        ? ([...widget.existing!.fridayPeriods]..sort((a, b) => a.periodNumber.compareTo(b.periodNumber)))
+            .map((p) => p.copyWith())
+            .toList()
+        : <TimePeriod>[];
+  }
+
+  void _toggleCustomFriday(bool value) {
+    setState(() {
+      _customFriday = value;
+      if (value && _fridayRows.isEmpty) {
+        // First time enabling: start from a copy of the regular timings,
+        // not a blank list — the admin is customizing FROM the normal
+        // schedule, not building Friday from scratch.
+        _fridayRows = _rows.map((r) => r.copyWith()).toList();
+      }
+    });
   }
 
   @override
@@ -361,8 +389,9 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
     return tod.format(context);
   }
 
-  Future<void> _pickTime(int index, bool isStart) async {
-    final row = _rows[index];
+  Future<void> _pickTime(int index, bool isStart, {bool friday = false}) async {
+    final list = friday ? _fridayRows : _rows;
+    final row = list[index];
     final currentMinutes = TimePeriod.toMinutes(isStart ? row.startTime : row.endTime);
     final initial = currentMinutes != null
         ? TimeOfDay(hour: currentMinutes ~/ 60, minute: currentMinutes % 60)
@@ -373,17 +402,18 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
     final formatted =
         '${picked.hour.toString().padLeft(2, '0')}:${picked.minute.toString().padLeft(2, '0')}';
     setState(() {
-      _rows[index] = isStart ? row.copyWith(startTime: formatted) : row.copyWith(endTime: formatted);
+      list[index] = isStart ? row.copyWith(startTime: formatted) : row.copyWith(endTime: formatted);
     });
   }
 
-  void _addRow({required bool isBreak}) {
-    final nextNumber = _rows.isEmpty ? 1 : (_rows.map((r) => r.periodNumber).reduce((a, b) => a > b ? a : b) + 1);
+  void _addRow({required bool isBreak, bool friday = false}) {
+    final list = friday ? _fridayRows : _rows;
+    final nextNumber = list.isEmpty ? 1 : (list.map((r) => r.periodNumber).reduce((a, b) => a > b ? a : b) + 1);
     // Default the new row to start right after the last row ends, when known.
     String start = '08:00';
     String end = '08:40';
-    if (_rows.isNotEmpty) {
-      final last = _rows.reduce((a, b) => a.periodNumber > b.periodNumber ? a : b);
+    if (list.isNotEmpty) {
+      final last = list.reduce((a, b) => a.periodNumber > b.periodNumber ? a : b);
       final lastEndMin = TimePeriod.toMinutes(last.endTime);
       if (lastEndMin != null) {
         start = _fmt(lastEndMin);
@@ -391,7 +421,7 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
       }
     }
     setState(() {
-      _rows.add(TimePeriod(
+      list.add(TimePeriod(
         periodNumber: nextNumber,
         startTime: start,
         endTime: end,
@@ -401,18 +431,20 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
     });
   }
 
-  void _removeRow(int index) => setState(() => _rows.removeAt(index));
+  void _removeRow(int index, {bool friday = false}) =>
+      setState(() => (friday ? _fridayRows : _rows).removeAt(index));
 
-  void _moveRow(int index, int delta) {
+  void _moveRow(int index, int delta, {bool friday = false}) {
+    final list = friday ? _fridayRows : _rows;
     final newIndex = index + delta;
-    if (newIndex < 0 || newIndex >= _rows.length) return;
+    if (newIndex < 0 || newIndex >= list.length) return;
     setState(() {
-      final a = _rows[index];
-      final b = _rows[newIndex];
+      final a = list[index];
+      final b = list[newIndex];
       // Swap period numbers AND list positions so ordering & numbering
       // stay in sync.
-      _rows[index] = b.copyWith(periodNumber: a.periodNumber);
-      _rows[newIndex] = a.copyWith(periodNumber: b.periodNumber);
+      list[index] = b.copyWith(periodNumber: a.periodNumber);
+      list[newIndex] = a.copyWith(periodNumber: b.periodNumber);
     });
   }
 
@@ -445,6 +477,34 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
       }
     }
 
+    if (_customFriday) {
+      if (_fridayRows.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Add at least one Friday period, or turn off custom Friday hours')),
+        );
+        return;
+      }
+      for (final r in _fridayRows) {
+        if (TimePeriod.toMinutes(r.startTime) == null || TimePeriod.toMinutes(r.endTime) == null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Friday: ${r.displayLabel} has an invalid time')),
+          );
+          return;
+        }
+        if (TimePeriod.toMinutes(r.endTime)! <= TimePeriod.toMinutes(r.startTime)!) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Friday: ${r.displayLabel} end time must be after start time')),
+          );
+          return;
+        }
+      }
+    }
+
+    // Empty list clears any previously-saved override — matches "when
+    // they edit it, only Friday is custom": turning the toggle back off
+    // reverts Friday to using the regular periods above.
+    final fridayToSave = _customFriday ? _fridayRows : <TimePeriod>[];
+
     setState(() => _saving = true);
     try {
       if (widget.existing != null) {
@@ -452,9 +512,14 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
           timeProfileId: widget.existing!.id,
           name: name,
           periods: _rows,
+          fridayPeriods: fridayToSave,
         );
       } else {
-        await _service.createTimeProfile(name: name, periods: _rows);
+        await _service.createTimeProfile(
+          name: name,
+          periods: _rows,
+          fridayPeriods: fridayToSave,
+        );
       }
       if (mounted) Navigator.pop(context);
     } catch (e) {
@@ -575,6 +640,67 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
                 return _periodRow(period, actualIndex, displayIndex, sortedRows.length);
               }),
               const SizedBox(height: 20),
+              GlassCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      value: _customFriday,
+                      onChanged: _toggleCustomFriday,
+                      title: const Text('Custom Friday hours', style: TextStyle(fontWeight: FontWeight.w700)),
+                      subtitle: Text(
+                        _customFriday
+                            ? 'Friday uses its own periods below instead of the regular schedule above.'
+                            : 'Off — Friday currently uses the same periods as every other day.',
+                        style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.65)),
+                      ),
+                    ),
+                    if (_customFriday) ...[
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Text('Friday periods & breaks', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+                          ),
+                          TextButton.icon(
+                            onPressed: () => _addRow(isBreak: false, friday: true),
+                            icon: const Icon(Icons.add, size: 18),
+                            label: const Text('Period'),
+                          ),
+                          TextButton.icon(
+                            onPressed: () => _addRow(isBreak: true, friday: true),
+                            icon: const Icon(Icons.free_breakfast_outlined, size: 18),
+                            label: const Text('Break'),
+                          ),
+                        ],
+                      ),
+                      Builder(builder: (context) {
+                        final sortedFridayRows = [..._fridayRows]
+                          ..sort((a, b) => a.periodNumber.compareTo(b.periodNumber));
+                        if (sortedFridayRows.isEmpty) {
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            child: Text(
+                              'No Friday periods yet — add rows above.',
+                              style: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
+                            ),
+                          );
+                        }
+                        return Column(
+                          children: sortedFridayRows.asMap().entries.map((entry) {
+                            final displayIndex = entry.key;
+                            final period = entry.value;
+                            final actualIndex = _fridayRows.indexOf(period);
+                            return _periodRow(period, actualIndex, displayIndex, sortedFridayRows.length, friday: true);
+                          }).toList(),
+                        );
+                      }),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
@@ -592,7 +718,8 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
     );
   }
 
-  Widget _periodRow(TimePeriod period, int actualIndex, int displayIndex, int total) {
+  Widget _periodRow(TimePeriod period, int actualIndex, int displayIndex, int total, {bool friday = false}) {
+    final list = friday ? _fridayRows : _rows;
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: GlassCard(
@@ -630,13 +757,13 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
                         border: InputBorder.none,
                         contentPadding: EdgeInsets.zero,
                       ),
-                      onChanged: (v) => _rows[actualIndex] = _rows[actualIndex].copyWith(label: v),
+                      onChanged: (v) => list[actualIndex] = list[actualIndex].copyWith(label: v),
                     ),
                   ),
                   Row(
                     children: [
                       InkWell(
-                        onTap: () => _pickTime(actualIndex, true),
+                        onTap: () => _pickTime(actualIndex, true, friday: friday),
                         child: Text(
                           _displayTime(period.startTime),
                           style: TextStyle(fontSize: 12.5, color: Colors.white.withValues(alpha: 0.8)),
@@ -647,7 +774,7 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
                         child: Text('–', style: TextStyle(fontSize: 12)),
                       ),
                       InkWell(
-                        onTap: () => _pickTime(actualIndex, false),
+                        onTap: () => _pickTime(actualIndex, false, friday: friday),
                         child: Text(
                           _displayTime(period.endTime),
                           style: TextStyle(fontSize: 12.5, color: Colors.white.withValues(alpha: 0.8)),
@@ -663,18 +790,18 @@ class _TimeProfileEditorPageState extends State<TimeProfileEditorPage> {
                 IconButton(
                   visualDensity: VisualDensity.compact,
                   icon: const Icon(Icons.arrow_upward, size: 16),
-                  onPressed: displayIndex > 0 ? () => _moveRow(actualIndex, -1) : null,
+                  onPressed: displayIndex > 0 ? () => _moveRow(actualIndex, -1, friday: friday) : null,
                 ),
                 IconButton(
                   visualDensity: VisualDensity.compact,
                   icon: const Icon(Icons.arrow_downward, size: 16),
-                  onPressed: displayIndex < total - 1 ? () => _moveRow(actualIndex, 1) : null,
+                  onPressed: displayIndex < total - 1 ? () => _moveRow(actualIndex, 1, friday: friday) : null,
                 ),
               ],
             ),
             IconButton(
               icon: const Icon(Icons.close, size: 18, color: Colors.redAccent),
-              onPressed: () => _removeRow(actualIndex),
+              onPressed: () => _removeRow(actualIndex, friday: friday),
             ),
           ],
         ),
